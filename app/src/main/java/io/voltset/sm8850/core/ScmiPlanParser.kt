@@ -48,7 +48,11 @@ object ScmiPlanParser {
         else -> throw IllegalArgumentException("不支持的 SCMI domain: $domain")
     }
 
-    fun parseCsv(csv: String, isSm8850: Boolean): List<ScmiPoint> {
+    fun parseCsv(
+        csv: String,
+        isSm8850: Boolean,
+        coefficients: Map<Int, Long> = emptyMap(),
+    ): List<ScmiPoint> {
         val byKey = linkedMapOf<Pair<Int, Long>, ScmiPoint>()
 
         for (rawLine in csv.lineSequence()) {
@@ -64,10 +68,11 @@ object ScmiPlanParser {
             val levelIndex = cols[6].trim().toIntOrNull() ?: continue
             if (freqKhz <= 0L || powerUw <= 0L) continue
 
-            val coeff = powerCoefficient(domain, isSm8850)
-            val rawMv = sqrt(powerUw.toDouble() * 1_000_000_000.0 / (coeff.toDouble() * freqKhz.toDouble()))
-            val roundedMv = (round(rawMv / 4.0) * 4.0).toInt()
-            val reconstructedUw = (coeff * freqKhz * roundedMv.toLong() * roundedMv.toLong()) / 1_000_000_000L
+            val verifiedCoefficient = coefficients[domain]
+            val coeff = verifiedCoefficient ?: powerCoefficient(domain, isSm8850)
+            val rawMv = estimateVoltage(powerUw, freqKhz, coeff)
+            val step = if (verifiedCoefficient != null) 1 else 4
+            val roundedMv = (round(rawMv / step) * step).toInt()
 
             byKey[domain to freqKhz] = ScmiPoint(
                 domain = domain,
@@ -75,12 +80,18 @@ object ScmiPlanParser {
                 freqKhz = freqKhz,
                 powerUw = powerUw,
                 voltageMv = roundedMv,
-                exactFormulaMatch = reconstructedUw == powerUw,
+                exactFormulaMatch = powerForVoltage(freqKhz, roundedMv, coeff) == powerUw,
             )
         }
 
         return byKey.values.sortedWith(compareBy({ it.domain }, { it.freqKhz }))
     }
+
+    internal fun estimateVoltage(powerUw: Long, frequencyKhz: Long, coefficient: Long): Double =
+        sqrt(powerUw.toDouble() * 1_000_000_000.0 / (coefficient * frequencyKhz.toDouble()))
+
+    internal fun powerForVoltage(frequencyKhz: Long, voltageMv: Int, coefficient: Long): Long =
+        (coefficient * frequencyKhz * voltageMv * voltageMv) / 1_000_000_000L
 
     fun diff(
         current: List<ScmiPoint>,
@@ -95,7 +106,8 @@ object ScmiPlanParser {
                 freqKhz = point.freqKhz,
                 currentMv = point.voltageMv,
                 baselineMv = base?.voltageMv,
-                deltaMv = base?.let { point.voltageMv - it.voltageMv },
+                deltaMv = base?.takeIf { point.exactFormulaMatch && it.exactFormulaMatch }
+                    ?.let { point.voltageMv - it.voltageMv },
                 expectedCdbCxMv = activeSet?.predictedCxOffsetForFreq(point.domain, point.freqKhz),
             )
         }

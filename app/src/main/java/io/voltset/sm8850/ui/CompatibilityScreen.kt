@@ -69,8 +69,8 @@ internal fun CompatibilityScreen(
                 onRefresh = onRefresh,
                 onCopyReport = {
                     val appVersion = runCatching {
-                        context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "0.2.0"
-                    }.getOrDefault("0.2.0")
+                        context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "未知"
+                    }.getOrDefault("未知")
                     val text = CompatibilityChecker.formatTextReport(snapshot, appVersion)
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     clipboard.setPrimaryClip(ClipData.newPlainText("VoltSet Compatibility Report", text))

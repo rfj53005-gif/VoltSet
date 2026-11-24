@@ -49,6 +49,9 @@ data class CompatibilityInput(
     val pdpCdbPath: String?,
     val pdpCdb: PdpCdbData?,
     val pdpCdbError: String?,
+    val pdpFwPath: String?,
+    val pdpHardwareLimits: PdpHardwareLimits?,
+    val pdpFwError: String?,
     val cdtStatus: CdtStatus,
     val scmiModuleAsset: String?,
     val scmiError: String?,
@@ -304,6 +307,43 @@ object CompatibilityChecker {
             }
         }
 
+        // 8. pdp firmware hardware [floor, ceil] tables (optional, non-blocking)
+        val fwLimits = input.pdpHardwareLimits
+        val fwClus0 = fwLimits?.clus0
+        val fwClus1 = fwLimits?.clus1
+        items += when {
+            fwLimits != null && fwClus0 != null && fwClus1 != null -> CompatibilityCheckItem(
+                id = "pdp_fw",
+                title = "pdp 固件硬件限位表（可选）",
+                status = CheckStatus.PASS,
+                summary = "已匹配双簇 floor/ceil（PDP0 ${fwClus0.limitsByFreqKhz.size} 档 / PDP1 ${fwClus1.limitsByFreqKhz.size} 档）",
+                detail = "已从 ${input.pdpFwPath ?: "pdp"}（${fwLimits.totalDcvsTablesFound} 张 DCVS 表）按本机频点自动匹配硬件上下限，首页支持按个体体质预估各 Set 实降范围。",
+                blocking = false,
+            )
+            fwLimits != null && (fwClus0 != null || fwClus1 != null) -> {
+                val matchedDesc = listOfNotNull(
+                    fwClus0?.let { "PDP0 ${it.limitsByFreqKhz.size} 档" },
+                    fwClus1?.let { "PDP1 ${it.limitsByFreqKhz.size} 档" },
+                ).joinToString(" / ")
+                CompatibilityCheckItem(
+                    id = "pdp_fw",
+                    title = "pdp 固件硬件限位表（可选）",
+                    status = CheckStatus.WARN,
+                    summary = "仅部分匹配（$matchedDesc）",
+                    detail = input.pdpFwError ?: "已读取 ${input.pdpFwPath ?: "pdp"}，仅部分集群完成唯一匹配，未匹配集群不影响 Set 切换，但切换前无法预估其钳位范围。",
+                    blocking = false,
+                )
+            }
+            else -> CompatibilityCheckItem(
+                id = "pdp_fw",
+                title = "pdp 固件硬件限位表（可选）",
+                status = CheckStatus.WARN,
+                summary = "未匹配到本机硬件限位（不影响调压）",
+                detail = input.pdpFwError ?: "未能从 ${input.pdpFwPath ?: "pdp"} 匹配本机双簇 floor/ceil 表。这仅影响切换 Set 前的「本机预计实降范围」推算，不影响切换 Set 或 SCMI 实测。",
+                blocking = false,
+            )
+        }
+
         val hasBlockingFailure = items.any { it.blocking && it.status == CheckStatus.FAIL }
         val nonPassingCount = items.count { it.status != CheckStatus.PASS }
 
@@ -357,6 +397,9 @@ object CompatibilityChecker {
             pdpCdbPath = snapshot.pdpCdbPath,
             pdpCdb = snapshot.pdpCdb,
             pdpCdbError = snapshot.pdpCdbError,
+            pdpFwPath = snapshot.pdpFwPath,
+            pdpHardwareLimits = snapshot.pdpHardwareLimits,
+            pdpFwError = snapshot.pdpFwError,
             cdtStatus = snapshot.cdtStatus,
             scmiModuleAsset = snapshot.scmiModuleAsset,
             scmiError = snapshot.scmiError,
@@ -364,14 +407,21 @@ object CompatibilityChecker {
         ),
     )
 
-    fun formatTextReport(snapshot: DeviceSnapshot, appVersion: String = "0.2.0"): String = buildString {
+    fun formatTextReport(snapshot: DeviceSnapshot, appVersion: String): String = buildString {
         val compat = snapshot.compatibility
         appendLine("VoltSet v$appVersion 设备兼容性检测报告")
         appendLine("结论: [${compat.level}] ${compat.headline}")
         appendLine("摘要: ${compat.subheadline}")
         appendLine("机型: ${snapshot.deviceModel} (${snapshot.deviceName}) | SoC: ${snapshot.socModel} | Slot: ${snapshot.slotSuffix.ifBlank { "none" }}")
         appendLine("内核: ${snapshot.kernelRelease} | 页大小: ${snapshot.pageSizeBytes?.toString() ?: "unknown"} B")
-        appendLine("SDAM: BOOT=${snapshot.bootCpussIndex ?: "?"} SDAM=${snapshot.sdamCpussIndex ?: "?"}/${snapshot.sdamGlobalIndex ?: "?"} 0x7151=${snapshot.reg7151Hex ?: "--"}")
+        appendLine("SDAM: ${snapshot.sdamCpussIndex ?: "?"}/${snapshot.sdamGlobalIndex ?: "?"} 0x7151=${snapshot.reg7151Hex ?: "--"}")
+        with(snapshot.bootSet) {
+            appendLine(
+                "开机档推定=${runningIndex ?: "?"} 固件锁档=${firmwareIndex ?: "—"} " +
+                    "本次首次读回=${firstSdamIndex ?: "?"} 上次启动写入=${previousTargetIndex ?: "—"} " +
+                    "当前待重启=${snapshot.pendingSetIndex ?: "—"}",
+            )
+        }
         appendLine()
         appendLine("[分项检测结果]")
         for (item in compat.items) {
@@ -388,6 +438,29 @@ object CompatibilityChecker {
                         "PDP0 CX ${s.clus0.minCxMv}..${s.clus0.maxCxMv} MX ${s.clus0.minMxMv}..${s.clus0.maxMxMv} | " +
                         "PDP1 CX ${s.clus1.minCxMv}..${s.clus1.maxCxMv} MX ${s.clus1.minMxMv}..${s.clus1.maxMxMv}",
                 )
+            }
+        }
+        val fwLimits = snapshot.pdpHardwareLimits
+        if (fwLimits != null || snapshot.setEstimates.isNotEmpty() || snapshot.pdpFwPath != null) {
+            appendLine()
+            appendLine("[pdp 硬件限位与本机预计范围]")
+            appendLine(
+                "分区: ${snapshot.pdpFwPath ?: "none"} | DCVS 表: ${fwLimits?.totalDcvsTablesFound ?: 0} | " +
+                    "PDP0=${fwLimits?.clus0?.limitsByFreqKhz?.size ?: 0} 档 PDP1=${fwLimits?.clus1?.limitsByFreqKhz?.size ?: 0} 档",
+            )
+            snapshot.pdpFwError?.let { appendLine("说明: $it") }
+            val pdp0Measured = ScmiPlanParser.summarizeByCluster(snapshot.voltageDiffRows, 0)
+            val pdp1Measured = ScmiPlanParser.summarizeByCluster(snapshot.voltageDiffRows, 1)
+            for (s in sets) {
+                val est = snapshot.setEstimates[s.setId] ?: continue
+                val c0Str = est.clus0?.let { "${it.minDeltaMv}..${it.maxDeltaMv} mV (下限${it.floorClampedBins} 单调${it.monotonicityClampedBins})" } ?: "—"
+                val c1Str = est.clus1?.let { "${it.minDeltaMv}..${it.maxDeltaMv} mV (下限${it.floorClampedBins} 单调${it.monotonicityClampedBins})" } ?: "—"
+                val measSuffix = if (s.setId == snapshot.bootCpussIndex && (pdp0Measured.minDeltaMv != null || pdp1Measured.minDeltaMv != null)) {
+                    " | 实测 PDP0=${pdp0Measured.minDeltaMv}..${pdp0Measured.maxDeltaMv} PDP1=${pdp1Measured.minDeltaMv}..${pdp1Measured.maxDeltaMv}"
+                } else {
+                    ""
+                }
+                appendLine("Set ${s.setId}: 本机预计 PDP0=$c0Str | PDP1=$c1Str$measSuffix")
             }
         }
     }

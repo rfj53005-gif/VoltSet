@@ -1,10 +1,14 @@
 package io.voltset.sm8850.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -16,6 +20,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
@@ -27,12 +32,14 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -52,6 +59,7 @@ internal fun VoltageScreen(
     snapshot: DeviceSnapshot,
     onSelectClusterFilter: (Int?) -> Unit,
     onCaptureBaseline: () -> Unit,
+    onShowMessage: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val rows = snapshot.voltageDiffRows
@@ -73,31 +81,34 @@ internal fun VoltageScreen(
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        if (snapshot.isSm8850) {
+            item(key = "quality") {
+                QualityCard(snapshot, onShowMessage, Modifier.padding(bottom = 12.dp))
+            }
+        }
         item(key = "scmi_summary") {
             ScmiSummaryCard(
                 snapshot = snapshot,
                 pdp0 = pdp0Stats,
                 pdp1 = pdp1Stats,
-                busy = state.busy,
+                controlsEnabled = state.controlsEnabled,
                 onCaptureBaseline = onCaptureBaseline,
             )
         }
 
         if (snapshot.scmiError != null) {
             item(key = "scmi_error") {
-                ScmiErrorCard(
-                    error = snapshot.scmiError,
-                    kernel = snapshot.kernelRelease,
-                )
+                Box(Modifier.padding(top = 12.dp)) {
+                    ScmiErrorCard(error = snapshot.scmiError, kernel = snapshot.kernelRelease)
+                }
             }
         } else {
             item(key = "filters") {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
                     FilterChip(
                         selected = state.selectedClusterFilter == null,
@@ -118,13 +129,95 @@ internal fun VoltageScreen(
             }
 
             if (filteredRows.isNotEmpty()) {
-                item(key = "table_container") {
-                    VoltageTableCard(
-                        rows = filteredRows,
-                        showClusterDivider = state.selectedClusterFilter == null,
-                        maxMv = maxMv,
-                    )
+                item(key = "table_header") { VoltageTableHeader() }
+                itemsIndexed(filteredRows, key = { _, row -> "${row.domain}/${row.freqKhz}" }) { index, row ->
+                    val newCluster = state.selectedClusterFilter == null &&
+                        (index == 0 || filteredRows[index - 1].domain != row.domain)
+                    VoltageTableEntry(row, maxMv, newCluster, index == filteredRows.lastIndex)
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun QualityCard(
+    snapshot: DeviceSnapshot,
+    onShowMessage: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val report = snapshot.qualityReport
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.primaryContainer,
+        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "体质电压表",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f),
+                )
+                if (report != null) {
+                    TextButton(onClick = {
+                        val text = buildString {
+                            appendLine("VoltSet 体质电压表 · ${snapshot.deviceModel}")
+                            appendLine("SCMI 计划电压 · 综合参考分 ${report.score}")
+                            snapshot.bootCpussIndex?.let { appendLine("开机档位 Set $it（${if (snapshot.bootSet.firmwareIndex == null) "推定" else "固件锁定"}）") }
+                            for (cluster in report.clusters) {
+                                appendLine()
+                                appendLine("PDP${cluster.domain} · ${cluster.score} 分 · C=${cluster.coefficient}")
+                                for (point in report.points.filter { it.domain == cluster.domain }) {
+                                    appendLine("${formatFreqMhz(point.freqKhz)}  ${point.voltageMv} mV  ${point.powerUw} µW")
+                                }
+                            }
+                        }
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("VoltSet 体质电压表", text))
+                        onShowMessage("已复制体质电压表")
+                    }) {
+                        Text("复制结果")
+                    }
+                }
+            }
+            if (report == null) {
+                Text(
+                    if (snapshot.scmiError != null) "读取 SCMI 计划电压后可查看体质参考分。"
+                    else "两次读表和电压换算需通过校验才显示分数，可刷新重试。",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            } else {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Column {
+                        Text("综合参考分", style = MaterialTheme.typography.labelMedium)
+                        Text(
+                            report.score.toString(),
+                            style = MaterialTheme.typography.headlineMedium.merge(TabularStyle),
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                    for (cluster in report.clusters) {
+                        Column {
+                            Text("PDP${cluster.domain} · C=${cluster.coefficient}", style = MaterialTheme.typography.labelMedium)
+                            Text(
+                                cluster.score.toString(),
+                                style = MaterialTheme.typography.headlineMedium.merge(TabularStyle),
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                    }
+                }
+                Text(
+                    "两次读取一致 · ${report.points.size} 个频点。分数随计划电压变化，仅供参考。",
+                    style = MaterialTheme.typography.bodySmall,
+                )
             }
         }
     }
@@ -135,7 +228,7 @@ private fun ScmiSummaryCard(
     snapshot: DeviceSnapshot,
     pdp0: ClusterVoltageStats,
     pdp1: ClusterVoltageStats,
-    busy: Boolean,
+    controlsEnabled: Boolean,
     onCaptureBaseline: () -> Unit,
 ) {
     val semantic = LocalVoltSetColors.current
@@ -160,17 +253,17 @@ private fun ScmiSummaryCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(
-                        text = "SCMI PERF 实时电压计划",
+                        text = "SCMI 计划电压对比",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                     )
                     Text(
-                        text = if (snapshot.bootCpussIndex != null) {
-                            "当前开机运行：Set ${snapshot.bootCpussIndex}"
-                        } else {
-                            "qcom-scmi-ro 即读即卸"
+                        text = when {
+                            snapshot.bootSet.firmwareIndex != null -> "固件锁定 Set ${snapshot.bootSet.firmwareIndex}"
+                            snapshot.bootCpussIndex != null -> "本次开机推定 Set ${snapshot.bootCpussIndex}"
+                            else -> "本次开机档待确认"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -211,7 +304,7 @@ private fun ScmiSummaryCard(
             if (snapshot.canSaveStockBaseline && snapshot.baselineSource != BaselineSource.VOLTSET) {
                 OutlinedButton(
                     onClick = onCaptureBaseline,
-                    enabled = !busy,
+                    enabled = controlsEnabled,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text("在 Set 1 采集并保存为 VoltSet 原厂基线")
@@ -312,80 +405,45 @@ private fun ScmiErrorCard(
 }
 
 @Composable
-private fun VoltageTableCard(
-    rows: List<VoltageDiffRow>,
-    showClusterDivider: Boolean,
-    maxMv: Int,
-) {
-    val semantic = LocalVoltSetColors.current
-    Card(
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        border = BorderStroke(1.dp, semantic.subtleBorder),
-        modifier = Modifier.fillMaxWidth(),
+private fun VoltageTableHeader() {
+    Surface(
+        shape = RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp),
+        color = MaterialTheme.colorScheme.surface,
+        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
     ) {
-        Column(modifier = Modifier.padding(vertical = 8.dp)) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "频率",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.weight(1.25f),
-                )
-                Text(
-                    text = "原厂",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    textAlign = TextAlign.End,
-                    modifier = Modifier.weight(0.8f),
-                )
-                Text(
-                    text = "当前",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    textAlign = TextAlign.End,
-                    modifier = Modifier.weight(0.85f),
-                )
-                Text(
-                    text = "实测变化",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    textAlign = TextAlign.End,
-                    modifier = Modifier.weight(1.0f),
-                )
-            }
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("频率", Modifier.weight(1.25f), style = MaterialTheme.typography.labelMedium)
+            Text("原厂", Modifier.weight(0.8f), textAlign = TextAlign.End, style = MaterialTheme.typography.labelMedium)
+            Text("当前", Modifier.weight(0.85f), textAlign = TextAlign.End, style = MaterialTheme.typography.labelMedium)
+            Text("基线差值", Modifier.weight(1f), textAlign = TextAlign.End, style = MaterialTheme.typography.labelMedium)
+        }
+    }
+}
 
-            var lastDomain = -1
-            rows.forEachIndexed { idx, row ->
-                if (showClusterDivider && row.domain != lastDomain) {
-                    lastDomain = row.domain
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(MaterialTheme.colorScheme.surfaceVariant)
-                            .padding(horizontal = 14.dp, vertical = 6.dp),
-                    ) {
-                        Text(
-                            text = if (row.domain == 0) "小核集群 · PDP0 (CPU0–5)" else "大核集群 · PDP1 (CPU6–7)",
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                } else if (idx > 0) {
-                    HorizontalDivider(
-                        color = semantic.subtleBorder.copy(alpha = 0.65f),
-                        modifier = Modifier.padding(horizontal = 14.dp),
-                    )
-                }
-
-                VoltageRowItem(row = row, maxMv = maxMv)
+@Composable
+private fun VoltageTableEntry(row: VoltageDiffRow, maxMv: Int, newCluster: Boolean, last: Boolean) {
+    Surface(
+        shape = RoundedCornerShape(bottomStart = if (last) 14.dp else 0.dp, bottomEnd = if (last) 14.dp else 0.dp),
+        color = MaterialTheme.colorScheme.surface,
+    ) {
+        Column {
+            if (newCluster) {
+                Text(
+                    text = if (row.domain == 0) "PDP0 · CPU0–5" else "PDP1 · CPU6–7",
+                    modifier = Modifier.fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .padding(horizontal = 14.dp, vertical = 7.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                HorizontalDivider(color = LocalVoltSetColors.current.subtleBorder, modifier = Modifier.padding(horizontal = 14.dp))
             }
+            VoltageRowItem(row = row, maxMv = maxMv)
         }
     }
 }

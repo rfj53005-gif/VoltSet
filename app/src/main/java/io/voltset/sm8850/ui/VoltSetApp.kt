@@ -3,6 +3,7 @@ package io.voltset.sm8850.ui
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -20,11 +21,14 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
@@ -55,6 +59,7 @@ internal fun VoltSetApp(
     onConsumeSnackbar: () -> Unit,
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
+    val tabs = rememberSaveableStateHolder()
 
     LaunchedEffect(state.snackbarMessage) {
         val msg = state.snackbarMessage ?: return@LaunchedEffect
@@ -63,6 +68,7 @@ internal fun VoltSetApp(
     }
 
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             Column {
                 TopAppBar(
@@ -73,10 +79,10 @@ internal fun VoltSetApp(
                                 fontWeight = FontWeight.Bold,
                             )
                             val snap = state.snapshot
-                            val subtitle = if (snap != null) {
-                                "${snap.socModel} · ${snap.deviceModel} · ${snap.deviceName}"
-                            } else {
-                                "SM8850 OEM 调压控制台"
+                            val subtitle = state.busyAction ?: when {
+                                state.loading -> "正在检测设备状态…"
+                                snap != null -> "${snap.socModel} · ${snap.deviceModel}"
+                                else -> "SM8850 OEM 调压"
                             }
                             Text(
                                 text = subtitle,
@@ -158,7 +164,7 @@ internal fun VoltSetApp(
                     ) {
                         CircularProgressIndicator()
                         Text(
-                            text = "正在读取 PMK8850 SDAM、pdp_cdb 与 SCMI 状态...",
+                            text = "正在读取档位和电压表…",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -203,31 +209,34 @@ internal fun VoltSetApp(
             }
 
             snap != null -> {
-                when (state.selectedTab) {
-                    VoltSetTab.SETS -> SetsScreen(
-                        state = state,
-                        snapshot = snap,
-                        onApplySet = onRequestApplySet,
-                        onResetDefault = onRequestResetDefault,
-                        onReboot = onRequestReboot,
-                        onToggleExpanded = onToggleExpanded,
-                        onOpenCompatTab = { onSelectTab(VoltSetTab.COMPAT) },
-                        modifier = Modifier.padding(innerPadding),
-                    )
-                    VoltSetTab.VOLTAGE -> VoltageScreen(
-                        state = state,
-                        snapshot = snap,
-                        onSelectClusterFilter = onSelectClusterFilter,
-                        onCaptureBaseline = onCaptureBaseline,
-                        modifier = Modifier.padding(innerPadding),
-                    )
-                    VoltSetTab.COMPAT -> CompatibilityScreen(
-                        state = state,
-                        snapshot = snap,
-                        onRefresh = onRefresh,
-                        onShowMessage = onShowMessage,
-                        modifier = Modifier.padding(innerPadding),
-                    )
+                Column(Modifier.fillMaxSize().padding(innerPadding)) {
+                    state.error?.let { SnapshotErrorBanner(it, onRefresh) }
+                    tabs.SaveableStateProvider(state.selectedTab.name) {
+                        when (state.selectedTab) {
+                            VoltSetTab.SETS -> SetsScreen(
+                                state = state,
+                                snapshot = snap,
+                                onApplySet = onRequestApplySet,
+                                onResetDefault = onRequestResetDefault,
+                                onReboot = onRequestReboot,
+                                onToggleExpanded = onToggleExpanded,
+                                onOpenCompatTab = { onSelectTab(VoltSetTab.COMPAT) },
+                            )
+                            VoltSetTab.VOLTAGE -> VoltageScreen(
+                                state = state,
+                                snapshot = snap,
+                                onSelectClusterFilter = onSelectClusterFilter,
+                                onCaptureBaseline = onCaptureBaseline,
+                                onShowMessage = onShowMessage,
+                            )
+                            VoltSetTab.COMPAT -> CompatibilityScreen(
+                                state = state,
+                                snapshot = snap,
+                                onRefresh = onRefresh,
+                                onShowMessage = onShowMessage,
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -250,5 +259,22 @@ internal fun VoltSetApp(
             onConfirm = onConfirmReboot,
             onDismiss = onDismissRebootConfirm,
         )
+    }
+}
+
+@Composable
+private fun SnapshotErrorBanner(error: String, onRetry: () -> Unit) {
+    Surface(color = MaterialTheme.colorScheme.errorContainer) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("显示上次读数 · 刷新后可操作", style = MaterialTheme.typography.titleSmall)
+                Text(error, style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            }
+            TextButton(onClick = onRetry) { Text("重试") }
+        }
     }
 }

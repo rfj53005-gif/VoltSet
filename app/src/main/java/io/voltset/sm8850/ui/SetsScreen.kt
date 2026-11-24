@@ -7,6 +7,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -21,7 +22,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -32,6 +32,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -43,12 +44,17 @@ import androidx.compose.ui.unit.dp
 import io.voltset.sm8850.R
 import io.voltset.sm8850.VoltSetUiState
 import io.voltset.sm8850.core.AdjustMode
+import io.voltset.sm8850.core.BaselineSource
 import io.voltset.sm8850.core.CdtState
 import io.voltset.sm8850.core.CdtStatus
+import io.voltset.sm8850.core.ClusterSetEstimate
 import io.voltset.sm8850.core.ClusterSetSummary
+import io.voltset.sm8850.core.ClusterVoltageStats
 import io.voltset.sm8850.core.CompatibilityLevel
 import io.voltset.sm8850.core.CompatibilityReport
 import io.voltset.sm8850.core.DeviceSnapshot
+import io.voltset.sm8850.core.ScmiPlanParser
+import io.voltset.sm8850.core.SetDeviceEstimate
 import io.voltset.sm8850.core.SetProfileTag
 import io.voltset.sm8850.core.VoltageSetProfile
 import java.util.Locale
@@ -65,10 +71,12 @@ internal fun SetsScreen(
     modifier: Modifier = Modifier,
 ) {
     val sets = snapshot.pdpCdb?.sets.orEmpty()
-    val canApplyUndervoltSet = snapshot.canWriteOverrides &&
-        !snapshot.overrideLockedByFirmware &&
-        snapshot.compatibility.level != CompatibilityLevel.UNSUPPORTED
-
+    val pdp0Measured = remember(snapshot.voltageDiffRows) {
+        ScmiPlanParser.summarizeByCluster(snapshot.voltageDiffRows, 0)
+    }
+    val pdp1Measured = remember(snapshot.voltageDiffRows) {
+        ScmiPlanParser.summarizeByCluster(snapshot.voltageDiffRows, 1)
+    }
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
@@ -77,7 +85,9 @@ internal fun SetsScreen(
         item(key = "hero") {
             StatusHeroCard(
                 snapshot = snapshot,
-                busy = state.busy,
+                pdp0Measured = pdp0Measured,
+                pdp1Measured = pdp1Measured,
+                controlsEnabled = state.controlsEnabled,
                 onResetDefault = onResetDefault,
                 onReboot = onReboot,
                 onRevertBootSet = {
@@ -135,31 +145,28 @@ internal fun SetsScreen(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        text = "pdp_cdb 预设档位 (${sets.size} 组)",
+                        text = "OEM 预设档位 (${sets.size} 组)",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
-                    )
-                    Text(
-                        text = "动态解析自设备分区",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }
 
             items(sets, key = { it.setId }) { profile ->
-                val allowApplyThisSet = if (profile.setId == 1) {
-                    snapshot.canWriteOverrides
-                } else {
-                    canApplyUndervoltSet
-                }
+                val isRunningSet = profile.setId == snapshot.bootCpussIndex
                 VoltageSetCard(
                     profile = profile,
-                    isBootActive = snapshot.bootCpussIndex == profile.setId,
+                    bootLabel = when (profile.setId) {
+                        snapshot.bootSet.firmwareIndex -> "固件锁定"
+                        snapshot.bootCpussIndex -> "开机推定"
+                        else -> null
+                    },
                     isSdamTarget = snapshot.sdamCpussIndex == profile.setId,
-                    pendingReboot = snapshot.pendingReboot,
-                    adjAvailable = allowApplyThisSet,
-                    busy = state.busy,
+                    isPending = snapshot.pendingSetIndex == profile.setId,
+                    measuredPdp0 = pdp0Measured.takeIf { isRunningSet && it.minDeltaMv != null && it.maxDeltaMv != null },
+                    measuredPdp1 = pdp1Measured.takeIf { isRunningSet && it.minDeltaMv != null && it.maxDeltaMv != null },
+                    estimate = snapshot.setEstimates[profile.setId],
+                    canApply = state.controlsEnabled && snapshot.canSelectSet(profile.setId),
                     expanded = profile.setId in state.expandedSetIds,
                     onToggleExpand = { onToggleExpanded(profile.setId) },
                     onApply = { onApplySet(profile) },
@@ -167,14 +174,6 @@ internal fun SetsScreen(
             }
         }
 
-        item(key = "footer_note") {
-            Text(
-                text = "说明：qcom_voltage_adj 将档位写入 PMK8850 SDAM2 (0x7151)，重启后由 XBL/PDP 固件读取并下发电压偏移；本应用不会写入任何开机自启脚本。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 4.dp, bottom = 12.dp),
-            )
-        }
     }
 }
 
@@ -260,15 +259,19 @@ private fun CompatibilitySummaryStrip(
 @Composable
 private fun StatusHeroCard(
     snapshot: DeviceSnapshot,
-    busy: Boolean,
+    pdp0Measured: ClusterVoltageStats,
+    pdp1Measured: ClusterVoltageStats,
+    controlsEnabled: Boolean,
     onResetDefault: () -> Unit,
     onReboot: () -> Unit,
     onRevertBootSet: () -> Unit,
 ) {
     val semantic = LocalVoltSetColors.current
-    val bootIdx = snapshot.bootCpussIndex
-    val sdamIdx = snapshot.sdamCpussIndex
-    val hexText = snapshot.reg7151Hex?.uppercase(Locale.US)?.let { "0x$it" } ?: "--"
+    val boot = snapshot.bootSet
+    val bootIndex = boot.runningIndex
+    val liveIndex = snapshot.sdamCpussIndex
+    val pendingIndex = snapshot.pendingSetIndex
+    val hex = snapshot.reg7151Hex?.uppercase(Locale.US)?.let { "0x$it" } ?: "—"
 
     Card(
         shape = RoundedCornerShape(18.dp),
@@ -280,112 +283,134 @@ private fun StatusHeroCard(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Row(
+            FlowRow(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.Top,
+                verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(
-                        text = if (snapshot.pendingReboot) "当前运行 Set ${bootIdx ?: "?"} → 待重启 Set ${sdamIdx ?: "?"}"
-                        else "当前 OEM 调压状态",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Text(
-                        text = when {
-                            sdamIdx != null -> if (sdamIdx == 1 && !snapshot.pendingReboot) {
-                                "Set 1（原厂默认）"
-                            } else {
-                                "Set ${bootIdx ?: sdamIdx}"
-                            }
-                            else -> "不可用"
-                        },
-                        style = MaterialTheme.typography.headlineMedium.merge(TabularStyle),
-                        fontWeight = FontWeight.Bold,
-                    )
-                }
-
+                Text("开机档位", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 CdtBadgeChip(cdtStatus = snapshot.cdtStatus)
             }
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                TelemetryPill(
-                    label = "0x7151",
-                    value = hexText,
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                SetReadout(
+                    label = "本次开机",
+                    value = bootIndex?.let { "Set $it" } ?: "待确认",
+                    detail = when {
+                        boot.firmwareIndex != null -> "固件锁定"
+                        bootIndex != null -> "首次 SDAM 读回推定"
+                        else -> "需核对开机档"
+                    },
+                    container = MaterialTheme.colorScheme.primaryContainer,
+                    content = MaterialTheme.colorScheme.onPrimaryContainer,
                     modifier = Modifier.weight(1f),
                 )
-                TelemetryPill(
-                    label = "CPUSS",
-                    value = sdamIdx?.toString() ?: "--",
-                    modifier = Modifier.weight(1f),
-                )
-                TelemetryPill(
-                    label = "Global",
-                    value = snapshot.sdamGlobalIndex?.toString() ?: "--",
-                    modifier = Modifier.weight(1f),
-                )
-                TelemetryPill(
-                    label = "槽位",
-                    value = snapshot.slotSuffix.ifBlank { "none" },
+                SetReadout(
+                    label = "SDAM 当前读回",
+                    value = when (liveIndex) {
+                        null -> "未读到"
+                        0 -> "索引 0"
+                        else -> "Set $liveIndex"
+                    },
+                    detail = "Global ${snapshot.sdamGlobalIndex ?: "—"}  ·  $hex",
+                    container = MaterialTheme.colorScheme.surfaceVariant,
+                    content = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.weight(1f),
                 )
             }
 
-            snapshot.activeBootSet?.let { active ->
-                Text(
-                    text = "生效偏移：PDP0 CX ${formatRange(active.clus0.minCxMv, active.clus0.maxCxMv)} · PDP1 CX ${formatRange(active.clus1.minCxMv, active.clus1.maxCxMv)}",
-                    style = MaterialTheme.typography.bodySmall.merge(TabularStyle),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+            val previous = boot.previousTargetIndex
+            val firstRead = boot.firstSdamIndex
+            if (previous != null && firstRead != null) {
+                if (boot.rebootReadbackMismatch) {
+                    val observed = if (firstRead == 0) "索引 0" else "Set $firstRead"
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = semantic.warnContainer,
+                        contentColor = semantic.onWarnContainer,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = "重启后读回不一致。上次写入 Set $previous，本次首次读回 $observed。",
+                            modifier = Modifier.padding(12.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                } else {
+                    Text(
+                        text = "重启后 SDAM 读回与上次写入一致 · Set $firstRead",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = semantic.onGoodContainer,
+                    )
+                }
             }
 
-            if (snapshot.pendingReboot && sdamIdx != null && bootIdx != null) {
+            if (pdp0Measured.minDeltaMv != null || pdp1Measured.minDeltaMv != null) {
+                val hasLowered = pdp0Measured.loweredBins > 0 || pdp1Measured.loweredBins > 0
                 Surface(
                     shape = RoundedCornerShape(12.dp),
-                    color = semantic.warnContainer,
-                    border = BorderStroke(1.dp, semantic.warnBorder),
+                    color = if (hasLowered) semantic.goodContainer.copy(alpha = 0.65f) else MaterialTheme.colorScheme.surfaceVariant,
+                    contentColor = if (hasLowered) semantic.onGoodContainer else MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Column(
                         modifier = Modifier.padding(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(3.dp),
                     ) {
                         Text(
-                            text = "SDAM 已写入 Set $sdamIdx，重启后生效",
+                            text = "本机实测 SCMI 降幅",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        pdp0Measured.minDeltaMv?.let { min0 ->
+                            val max0 = pdp0Measured.maxDeltaMv ?: min0
+                            Text(
+                                text = "小核 PDP0：${formatRange(min0, max0)}（降压 ${pdp0Measured.loweredBins}/${pdp0Measured.totalBins} 档）",
+                                style = MaterialTheme.typography.bodySmall.merge(TabularStyle),
+                            )
+                        }
+                        pdp1Measured.minDeltaMv?.let { min1 ->
+                            val max1 = pdp1Measured.maxDeltaMv ?: min1
+                            Text(
+                                text = "大核 PDP1：${formatRange(min1, max1)}（降压 ${pdp1Measured.loweredBins}/${pdp1Measured.totalBins} 档）",
+                                style = MaterialTheme.typography.bodySmall.merge(TabularStyle),
+                            )
+                        }
+                    }
+                }
+            } else if (snapshot.baselineSource == BaselineSource.NONE && snapshot.scmiError == null) {
+                Text(
+                    text = "切回 Set 1 重启后自动采集原厂基线，首页即可按本机体质显示各档预计/实测降幅。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            if (pendingIndex != null) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = semantic.warnContainer,
+                    contentColor = semantic.onWarnContainer,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            "Set $pendingIndex 待重启核对",
                             style = MaterialTheme.typography.titleSmall,
                             fontWeight = FontWeight.SemiBold,
-                            color = semantic.onWarnContainer,
                         )
-                        Text(
-                            text = "当前开机仍运行在 Set $bootIdx。重启设备后 XBL/PDP 将读取 0x7151=$hexText 应用新配置。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = semantic.onWarnContainer,
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(
-                                onClick = onReboot,
-                                enabled = !busy,
-                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
-                            ) {
-                                Icon(
-                                    painter = painterResource(R.drawable.ic_restart),
-                                    contentDescription = null,
-                                    modifier = Modifier.size(16.dp),
-                                )
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = onReboot, enabled = controlsEnabled) {
+                                Icon(painterResource(R.drawable.ic_restart), null, Modifier.size(16.dp))
                                 Spacer(Modifier.width(6.dp))
                                 Text("立即重启")
                             }
-                            if (snapshot.activeBootSet != null) {
+                            if (bootIndex != null && snapshot.activeBootSet != null) {
                                 OutlinedButton(
                                     onClick = onRevertBootSet,
-                                    enabled = !busy && snapshot.canWriteOverrides,
-                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                                    enabled = controlsEnabled && snapshot.canSelectSet(bootIndex),
                                 ) {
-                                    Text("撤回至 Set $bootIdx")
+                                    Text("撤回至 Set $bootIndex")
                                 }
                             }
                         }
@@ -393,43 +418,14 @@ private fun StatusHeroCard(
                 }
             }
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
+            if (liveIndex != null && liveIndex != 1 && !snapshot.overrideLockedByFirmware) {
                 OutlinedButton(
                     onClick = onResetDefault,
-                    enabled = !busy && snapshot.canWriteOverrides && sdamIdx != 1,
-                    modifier = Modifier.weight(1f),
+                    enabled = controlsEnabled && snapshot.canSelectSet(1),
                 ) {
-                    Icon(
-                        painter = painterResource(R.drawable.ic_restore),
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp),
-                    )
+                    Icon(painterResource(R.drawable.ic_restore), null, Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
-                    Text(if (sdamIdx == 1) "已是 Set 1" else "还原默认 Set 1")
-                }
-
-                Button(
-                    onClick = onReboot,
-                    enabled = !busy,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (snapshot.pendingReboot) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.secondary
-                        },
-                    ),
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Icon(
-                        painter = painterResource(R.drawable.ic_restart),
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp),
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Text("重启生效")
+                    Text("还原默认 Set 1")
                 }
             }
         }
@@ -437,32 +433,24 @@ private fun StatusHeroCard(
 }
 
 @Composable
-private fun TelemetryPill(
+private fun SetReadout(
     label: String,
     value: String,
+    detail: String,
+    container: Color,
+    content: Color,
     modifier: Modifier = Modifier,
 ) {
     Surface(
-        shape = RoundedCornerShape(10.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(12.dp),
+        color = container,
+        contentColor = content,
         modifier = modifier,
     ) {
-        Column(
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-            horizontalAlignment = Alignment.Start,
-        ) {
-            Text(
-                text = label,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Text(
-                text = value,
-                style = MaterialTheme.typography.bodyMedium.merge(TabularStyle),
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-            )
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(label, style = MaterialTheme.typography.labelMedium)
+            Text(value, style = MaterialTheme.typography.headlineSmall.merge(TabularStyle), fontWeight = FontWeight.Bold)
+            Text(detail, style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -610,19 +598,21 @@ private fun WarningBannerCard(
 @Composable
 private fun VoltageSetCard(
     profile: VoltageSetProfile,
-    isBootActive: Boolean,
+    bootLabel: String?,
     isSdamTarget: Boolean,
-    pendingReboot: Boolean,
-    adjAvailable: Boolean,
-    busy: Boolean,
+    isPending: Boolean,
+    measuredPdp0: ClusterVoltageStats?,
+    measuredPdp1: ClusterVoltageStats?,
+    estimate: SetDeviceEstimate?,
+    canApply: Boolean,
     expanded: Boolean,
     onToggleExpand: () -> Unit,
     onApply: () -> Unit,
 ) {
     val semantic = LocalVoltSetColors.current
-    val highlighted = isBootActive || isSdamTarget
+    val highlighted = bootLabel != null || isSdamTarget
     val borderColor = when {
-        isSdamTarget && pendingReboot -> semantic.warnBorder
+        isPending -> semantic.warnBorder
         highlighted -> MaterialTheme.colorScheme.primary
         else -> semantic.subtleBorder
     }
@@ -637,45 +627,25 @@ private fun VoltageSetCard(
             modifier = Modifier.padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Row(
+            FlowRow(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Text(
-                        text = "Set ${profile.setId}",
-                        style = MaterialTheme.typography.titleLarge.merge(TabularStyle),
-                        fontWeight = FontWeight.Bold,
-                    )
-                    SetTagChip(profile = profile)
-                    if (profile.isAggressive) {
-                        StatusMiniChip(
-                            text = "激进",
-                            container = semantic.dangerContainer,
-                            content = semantic.onDangerContainer,
-                        )
-                    }
+                Text(
+                    text = "Set ${profile.setId}",
+                    style = MaterialTheme.typography.titleLarge.merge(TabularStyle),
+                    fontWeight = FontWeight.Bold,
+                )
+                SetTagChip(profile = profile)
+                if (profile.isAggressive) {
+                    StatusMiniChip("激进", semantic.dangerContainer, semantic.onDangerContainer)
                 }
-
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    if (isBootActive) {
-                        StatusMiniChip(
-                            text = if (pendingReboot) "当前运行" else "当前生效",
-                            container = MaterialTheme.colorScheme.primaryContainer,
-                            content = MaterialTheme.colorScheme.onPrimaryContainer,
-                        )
-                    }
-                    if (isSdamTarget && pendingReboot) {
-                        StatusMiniChip(
-                            text = "待重启生效",
-                            container = semantic.warnContainer,
-                            content = semantic.onWarnContainer,
-                        )
-                    }
+                if (bootLabel != null) {
+                    StatusMiniChip(bootLabel, MaterialTheme.colorScheme.primaryContainer, MaterialTheme.colorScheme.onPrimaryContainer)
+                }
+                if (isSdamTarget) {
+                    StatusMiniChip(if (isPending) "待重启" else "SDAM 读回", semantic.warnContainer, semantic.onWarnContainer)
                 }
             }
 
@@ -686,18 +656,25 @@ private fun VoltageSetCard(
                 ClusterSummaryBox(
                     title = "小核 PDP0 (CPU0–5)",
                     summary = profile.clus0,
+                    measured = measuredPdp0,
+                    estimate = estimate?.clus0,
                     modifier = Modifier.weight(1f),
                 )
                 ClusterSummaryBox(
                     title = "大核 PDP1 (CPU6–7)",
                     summary = profile.clus1,
+                    measured = measuredPdp1,
+                    estimate = estimate?.clus1,
                     modifier = Modifier.weight(1f),
                 )
             }
 
+            val limited0 = estimate?.clus0?.bins.orEmpty().count { it.deltaMv != it.cdbOffsetMv || it.atStockCeiling }
+            val limited1 = estimate?.clus1?.bins.orEmpty().count { it.deltaMv != it.cdbOffsetMv || it.atStockCeiling }
             val hasDetails = profile.clus0.entries.isNotEmpty() || profile.clus1.entries.isNotEmpty() ||
                 profile.clus0.allCxMv != 0 || profile.clus1.allCxMv != 0 ||
-                profile.clus0.allMxMv != 0 || profile.clus1.allMxMv != 0
+                profile.clus0.allMxMv != 0 || profile.clus1.allMxMv != 0 ||
+                limited0 > 0 || limited1 > 0
 
             if (hasDetails) {
                 Row(
@@ -710,8 +687,13 @@ private fun VoltageSetCard(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     val totalPoints = profile.clus0.entries.size + profile.clus1.entries.size
+                    val totalLimited = limited0 + limited1
+                    val label = buildList {
+                        if (totalPoints > 0) add("分频规则 $totalPoints 条") else add("规则明细")
+                        if (totalLimited > 0) add("受限频点 $totalLimited 个")
+                    }.joinToString(" · ")
                     Text(
-                        text = if (totalPoints > 0) "查看 pdp_cdb 分频明细 ($totalPoints 条频点规则)" else "查看 pdp_cdb 规则明细",
+                        text = "查看 pdp_cdb $label",
                         style = MaterialTheme.typography.labelLarge,
                         color = MaterialTheme.colorScheme.primary,
                     )
@@ -731,32 +713,16 @@ private fun VoltageSetCard(
                         modifier = Modifier.padding(top = 2.dp),
                     ) {
                         HorizontalDivider(color = semantic.subtleBorder)
-                        ClusterDetailBlock("小核 PDP0 明细", profile.clus0)
-                        ClusterDetailBlock("大核 PDP1 明细", profile.clus1)
+                        ClusterDetailBlock("小核 PDP0 明细", profile.clus0, estimate?.clus0)
+                        ClusterDetailBlock("大核 PDP1 明细", profile.clus1, estimate?.clus1)
                     }
                 }
             }
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End,
-            ) {
-                val isCurrentSdam = isSdamTarget
-                Button(
-                    onClick = onApply,
-                    enabled = adjAvailable && !busy && !isCurrentSdam,
-                    shape = RoundedCornerShape(10.dp),
-                ) {
-                    if (isCurrentSdam) {
-                        Icon(
-                            painter = painterResource(R.drawable.ic_check_circle),
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp),
-                        )
-                        Spacer(Modifier.width(6.dp))
-                        Text("已写入 SDAM")
-                    } else {
-                        Text("应用 Set ${profile.setId}")
+            if (!isSdamTarget) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    Button(onClick = onApply, enabled = canApply, shape = RoundedCornerShape(10.dp)) {
+                        Text("设为下次开机")
                     }
                 }
             }
@@ -812,6 +778,8 @@ private fun StatusMiniChip(
 private fun ClusterSummaryBox(
     title: String,
     summary: ClusterSetSummary,
+    measured: ClusterVoltageStats?,
+    estimate: ClusterSetEstimate?,
     modifier: Modifier = Modifier,
 ) {
     val semantic = LocalVoltSetColors.current
@@ -829,25 +797,92 @@ private fun ClusterSummaryBox(
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Text(
-                text = "CX  ${formatRange(summary.minCxMv, summary.maxCxMv)}",
-                style = MaterialTheme.typography.bodyMedium.merge(TabularStyle),
-                fontWeight = FontWeight.SemiBold,
-                color = if (summary.minCxMv < 0) semantic.goodAccent else MaterialTheme.colorScheme.onSurface,
-            )
-            Text(
-                text = "MX  ${formatRange(summary.minMxMv, summary.maxMxMv)}",
-                style = MaterialTheme.typography.bodySmall.merge(TabularStyle),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            when {
+                measured != null && measured.minDeltaMv != null && measured.maxDeltaMv != null -> {
+                    Text(
+                        text = "实测  ${formatRange(measured.minDeltaMv, measured.maxDeltaMv)}",
+                        style = MaterialTheme.typography.bodyMedium.merge(TabularStyle),
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (measured.minDeltaMv < 0) semantic.goodAccent else MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = "表定 CX ${formatRange(summary.minCxMv, summary.maxCxMv)} · MX ${formatRange(summary.minMxMv, summary.maxMxMv)}",
+                        style = MaterialTheme.typography.labelSmall.merge(TabularStyle),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = "降压 ${measured.loweredBins}/${measured.totalBins} 档",
+                        style = MaterialTheme.typography.labelSmall.merge(TabularStyle),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                estimate != null -> {
+                    val prefix = if (estimate.hasRoundingVariance || estimate.ceilingRiskBins > 0) "预计约" else "预计"
+                    Text(
+                        text = "$prefix  ${formatRange(estimate.minDeltaMv, estimate.maxDeltaMv)}",
+                        style = MaterialTheme.typography.bodyMedium.merge(TabularStyle),
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (estimate.minDeltaMv < 0) semantic.goodAccent else MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = "表定 CX ${formatRange(summary.minCxMv, summary.maxCxMv)} · MX ${formatRange(summary.minMxMv, summary.maxMxMv)}",
+                        style = MaterialTheme.typography.labelSmall.merge(TabularStyle),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = formatEstimateMicroNote(estimate),
+                        style = MaterialTheme.typography.labelSmall.merge(TabularStyle),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                else -> {
+                    Text(
+                        text = "表定 CX  ${formatRange(summary.minCxMv, summary.maxCxMv)}",
+                        style = MaterialTheme.typography.bodyMedium.merge(TabularStyle),
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (summary.minCxMv < 0) semantic.goodAccent else MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = "表定 MX  ${formatRange(summary.minMxMv, summary.maxMxMv)}",
+                        style = MaterialTheme.typography.bodySmall.merge(TabularStyle),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
         }
     }
+}
+
+private fun formatEstimateMicroNote(estimate: ClusterSetEstimate): String {
+    val notes = buildList {
+        if (estimate.floorClampedBins > 0) add("${estimate.floorClampedBins} 档触及下限")
+        if (estimate.monotonicityClampedBins > 0) add("${estimate.monotonicityClampedBins} 档受单调限位")
+        if (estimate.ceilingRiskBins > 0) add("${estimate.ceilingRiskBins} 档原厂顶上限")
+    }
+    return when {
+        notes.isNotEmpty() -> notes.joinToString(" · ")
+        estimate.minDeltaMv < 0 -> "全 ${estimate.totalBins} 档按表定生效"
+        else -> "保持原厂（共 ${estimate.totalBins} 档）"
+    }
+}
+
+private fun formatConstraintReason(bin: io.voltset.sm8850.core.BinVoltageEstimate): String {
+    val reasons = buildList {
+        if (bin.clampedByFloor) add("触及下限 ${bin.floorMv}")
+        if (bin.clampedByMonotonicity) add("单调限位")
+        if (bin.atStockCeiling) add("原厂顶上限 ${bin.ceilMv}")
+        if (!bin.clampedByFloor && !bin.clampedByMonotonicity && bin.cdbOffsetMv % 4 != 0 && bin.deltaMv != bin.cdbOffsetMv) {
+            add("4mV 对齐")
+        }
+    }
+    return if (reasons.isNotEmpty()) reasons.joinToString("·") else "步进收敛"
 }
 
 @Composable
 private fun ClusterDetailBlock(
     title: String,
     summary: ClusterSetSummary,
+    estimate: ClusterSetEstimate?,
 ) {
     val semantic = LocalVoltSetColors.current
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -908,6 +943,45 @@ private fun ClusterDetailBlock(
                 )
             }
         }
+
+        val limitedBins = estimate?.bins.orEmpty().filter {
+            it.deltaMv != it.cdbOffsetMv || it.atStockCeiling
+        }
+        if (limitedBins.isNotEmpty()) {
+            Text(
+                text = "本机受限频点预览 (${limitedBins.size} 档)",
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+            for (bin in limitedBins) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp, vertical = 2.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = formatFreqMhz(bin.freqKhz),
+                        style = MaterialTheme.typography.bodySmall.merge(TabularStyle),
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.width(92.dp),
+                    )
+                    Text(
+                        text = "${bin.baselineMv}→${bin.estimatedMv} (${formatSignedMv(bin.deltaMv)})",
+                        style = MaterialTheme.typography.bodySmall.merge(TabularStyle),
+                        color = if (bin.deltaMv < 0) semantic.goodAccent else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = formatConstraintReason(bin),
+                        style = MaterialTheme.typography.labelSmall.merge(TabularStyle),
+                        color = semantic.onWarnContainer,
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -924,6 +998,7 @@ internal fun ApplySetConfirmDialog(
     val targetHexByte = rawDec or 0x88
     val currentHex = snapshot.reg7151Hex?.uppercase(Locale.US)?.let { "0x$it" } ?: "--"
     val targetHex = "0x%02X".format(Locale.US, targetHexByte)
+    val estimate = snapshot.setEstimates[target.setId]
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -950,6 +1025,11 @@ internal fun ApplySetConfirmDialog(
                         verticalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
                         Text(
+                            text = "表定偏移（pdp_cdb）",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
                             text = "小核 PDP0：CX ${formatRange(target.clus0.minCxMv, target.clus0.maxCxMv)}，MX ${formatRange(target.clus0.minMxMv, target.clus0.maxMxMv)}",
                             style = MaterialTheme.typography.bodySmall.merge(TabularStyle),
                         )
@@ -957,6 +1037,16 @@ internal fun ApplySetConfirmDialog(
                             text = "大核 PDP1：CX ${formatRange(target.clus1.minCxMv, target.clus1.maxCxMv)}，MX ${formatRange(target.clus1.minMxMv, target.clus1.maxMxMv)}",
                             style = MaterialTheme.typography.bodySmall.merge(TabularStyle),
                         )
+                        if (estimate != null && (estimate.clus0 != null || estimate.clus1 != null)) {
+                            val est0 = estimate.clus0?.let { formatRange(it.minDeltaMv, it.maxDeltaMv) } ?: "--"
+                            val est1 = estimate.clus1?.let { formatRange(it.minDeltaMv, it.maxDeltaMv) } ?: "--"
+                            Text(
+                                text = "本机预计实降：小核 $est0 · 大核 $est1",
+                                style = MaterialTheme.typography.bodySmall.merge(TabularStyle),
+                                fontWeight = FontWeight.SemiBold,
+                                color = semantic.goodAccent,
+                            )
+                        }
                     }
                 }
 
@@ -1015,17 +1105,13 @@ internal fun RebootConfirmDialog(
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val targetSet = snapshot.sdamCpussIndex
+    val targetSet = snapshot.pendingSetIndex ?: return
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("确认立即重启？", fontWeight = FontWeight.Bold) },
         text = {
             Text(
-                text = if (snapshot.pendingReboot && targetSet != null) {
-                    "设备将立即重启，下次开机时 XBL/PDP 会从 SDAM 加载 Set $targetSet。"
-                } else {
-                    "设备将立即重启。当前 SDAM 设定为 Set ${targetSet ?: "?"}。"
-                },
+                text = "设备将立即重启。下次打开 VoltSet 时会核对 SDAM 是否仍为 Set $targetSet。",
                 style = MaterialTheme.typography.bodyMedium,
             )
         },

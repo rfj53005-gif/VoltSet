@@ -15,17 +15,20 @@
 
 - **OEM Set 1–7 档位切换与一键还原**
   - 动态扫描 `/proc/mounts` 中的 `debugfs` 挂载点（兼容 KernelSU/Magisk 随机路径），读写 `qcom_voltage_adj/get_overrides` 与 `set_overrides`，同步交叉核对 PMIC `regmap/0-00` 寄存器 `0x7151`。
-  - 精确区分**当前本次开机正在运行的 Set** 与 **SDAM2 中已写入、待重启生效的 Set**，提供立即重启、撤回与一键恢复默认 Set 1。
+  - 每次打开或返回前台自动检测，分别显示**本次开机档推定**和 **SDAM 当前读回**。重启后比对上次由 VoltSet 写入的档位与本次首次读回，发生差异时显示待确认。
+  - 待重启档位可重启核对、撤回或还原默认 Set 1。
   - **不创建任何开机自启脚本**：目标档位保存在 PMIC 硬件 SDAM2 中，重启由引导阶段自动应用。
-- **`pdp_cdb` 分区动态二进制解析（无硬编码电压表）**
-  - 自动按当前 A/B 槽位读取设备自身的 `/dev/block/by-name/pdp_cdb[_a|_b]`，在 Kotlin 中完成 `ELF32 → CFDB v3 → sdbm 哈希` 解析。
-  - 真实还原 `ALL` 全局基底与 `FREQ` / `PSTATE` 分频叠加值，并检测固件内是否存在强制锁死档位的 `OEM_VOLTAGE_ADJUSTMENTS_SET_OVERRIDE`。
-- **7 项只读设备兼容性检测**
-  - 针对不同机型与内核环境一键检查 SoC 平台、`qcom_voltage_adj` 读写节点、`0x7151` 寄存器回读、`pdp_cdb` 有效降压条目、固件覆盖锁、CDT Key 7 风险及 SCMI 模块/内核页大小匹配度，支持一键复制完整文本诊断报告。
+- **`pdp_cdb` 与 `pdp` 固件双表自动动态解析（无硬编码电压表）**
+  - 自动按当前 A/B 槽位读取设备自身的 `/dev/block/by-name/pdp_cdb[_a|_b]`，在 Kotlin 中完成 `ELF32 → CFDB v3 → sdbm 哈希` 解析，真实还原 `ALL` 全局基底与 `FREQ` / `PSTATE` 分频叠加值，并检测固件内是否存在强制锁死档位的 `OEM_VOLTAGE_ADJUSTMENTS_SET_OVERRIDE`。
+  - **自动按体质匹配硬件限位**：同时只读读取活动槽位 `/dev/block/by-name/pdp[_a|_b]` 内的 `CFDB v3` DCVS 硬件限位表，不硬编码机型/bin 名称，通过结构体指纹与本机 SCMI 频点列表自动匹配各频点 `[floor, ceil]` 上下限。
+  - **首页分机个体化范围显示**：结合本机 Set 1 原厂基线，按固件公式（`floor` 下限钳位 + `4 mV` 向上取整 + 单调递增约束）在切换前即为每个 Set 推算**本机预计实降范围**，并在生效后于首页直接展示**本机实测 SCMI 降幅**，区分「表定偏移」与「个体实降」。
+- **8 项只读设备兼容性检测**
+  - 针对不同机型与内核环境一键检查 SoC 平台、`qcom_voltage_adj` 读写节点、`0x7151` 寄存器回读、`pdp_cdb` 有效降压条目、固件覆盖锁、CDT Key 7 风险、SCMI 模块/内核页大小匹配度及 `pdp` 硬件限位表匹配状态，支持一键复制完整文本诊断报告。
 - **只读 CDT Key 7 (SLT+ACD) 叠加风险预警**
   - 自动只读检查 `/dev/block/by-name/cdt`（兼容全零空分区、OEM 精简 9 字节 v6 及完整 v3–v6）；若发现同时开启了 CDT Key 7，将在首页和写入确认弹窗中发出显著警告，避免双重降压导致无法开机。
 - **即读即卸的 SCMI 实时电压对比**
   - 每次刷新仅在操作锁保护下临时加载 `qcom-scmi-ro.ko` 读取最新 SCMI 电压计划并在退出前立即 `rmmod`。
+  - SM8850 在「SCMI 电压」页提供体质电压表。两次读取一致且整数电压换算通过后显示双簇参考分、综合分和可复制的频点表。评分规则参考 [jkHXQ 的 RMX5010-CPU-Voltage](https://github.com/jkHXQ/RMX5010-CPU-Voltage#输出与评分)，分数随当前电压计划变化。
   - 在确认处于原厂 Set 1（且 CDT Key 7 关闭）时自动记录原厂基线至 `/data/adb/voltset/persistent/stock-baseline.csv`，若本机已有 SunTuner 采集过的基线也可直接只读复用。
 
 ---
@@ -105,9 +108,9 @@ $$\text{power\_uW} = \left\lfloor \frac{\text{coeff} \times \text{freq\_kHz} \ti
 
 ---
 
-## 实机测试参考（Xiaomi 17 Pro / `2509FPN0BC`）
+## 单机实测参考样本（Xiaomi 17 Pro / `2509FPN0BC`）
 
-在 `2509FPN0BC`（SM8850，Stock 空 CDT）上动态解析 `pdp_cdb_a` 得到的 7 组预设如下（不同机型/OS 版本可能差异很大，请以本机 App 内实时解析为准）：
+以下为一台实机（`2509FPN0BC`，SM8850，Stock 空 CDT）动态解析 `pdp_cdb_a` 得到的 7 组**表定**预设，以及结合该机自身 `pdp_a` `[floor, ceil]` 限位与 Set 1 体质基线算出的实降差异（不同机型/ROM/芯片体质会各不相同，请以本机 App 首页实时解析结果为准）：
 
 | 档位 | 类型 | 小核 PDP0 (CPU0–5) CX / MX | 大核 PDP1 (CPU6–7) CX / MX |
 | --- | --- | --- | --- |

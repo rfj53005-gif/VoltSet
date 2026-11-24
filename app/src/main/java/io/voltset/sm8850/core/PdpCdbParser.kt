@@ -60,6 +60,22 @@ data class ClusterSetSummary(
         val exact = entries.firstOrNull { it.mode == AdjustMode.FREQ && it.value == freqKhz }
         return exact?.effectiveCxMv ?: allCxMv
     }
+
+    /**
+     * Firmware (`0x200290bc` -> `0x20029b44`) accumulates `ALL`, matching `FREQ`,
+     * and matching `PSTATE` rules for the same slot.
+     */
+    fun predictedCxOffsetForBin(freqKhz: Long, levelIndex: Int): Int {
+        var delta = allCxMv
+        for (entry in entries) {
+            when (entry.mode) {
+                AdjustMode.FREQ -> if (entry.value == freqKhz) delta += entry.rawDeltaCxMv
+                AdjustMode.PSTATE -> if (entry.value == levelIndex.toLong()) delta += entry.rawDeltaCxMv
+                AdjustMode.ALL, AdjustMode.UNKNOWN -> Unit
+            }
+        }
+        return delta
+    }
 }
 
 /** Decoded configuration for one OEM voltage adjustment Set (typically 1..7). */
@@ -83,6 +99,12 @@ data class VoltageSetProfile(
         1 -> clus1.predictedCxOffsetForFreq(freqKhz)
         else -> null
     }
+
+    fun predictedCxOffsetForBin(cluster: Int, freqKhz: Long, levelIndex: Int): Int? = when (cluster) {
+        0 -> clus0.predictedCxOffsetForBin(freqKhz, levelIndex)
+        1 -> clus1.predictedCxOffsetForBin(freqKhz, levelIndex)
+        else -> null
+    }
 }
 
 /** Full decoded pdp_cdb partition payload. */
@@ -97,13 +119,11 @@ data class PdpCdbData(
  * Pure-Kotlin parser for Qualcomm SM8850 `pdp_cdb` partitions (ELF32 -> CFDB v3 -> OEM_VOLTAGE_ADJUSTMENTS).
  */
 object PdpCdbParser {
-    const val CFDB_MAGIC: UInt = 0x0003DBCFu
+    const val CFDB_MAGIC: UInt = CfdbReader.CFDB_MAGIC
     const val HASH_OVERRIDE: UInt = 0xB47A3C0Bu
     const val HASH_CLUS0: UInt = 0x0E675698u
     const val HASH_CLUS1: UInt = 0x7AC09099u
 
-    private const val CFDB_HEADER_SIZE = 16
-    private const val CFDB_ENTRY_SIZE = 16
     private const val RECORD_SIZE = 13
 
     fun sdbmHash(name: String): UInt {
@@ -115,44 +135,22 @@ object PdpCdbParser {
     }
 
     fun parse(bytes: ByteArray): PdpCdbData {
-        require(bytes.size >= CFDB_HEADER_SIZE) { "pdp_cdb 数据长度不足 (${bytes.size} B)" }
-
-        val (cfdbOffset, cfdbLength) = locateCfdb(bytes)
-        require(cfdbOffset >= 0 && cfdbLength >= CFDB_HEADER_SIZE && cfdbOffset + cfdbLength <= bytes.size) {
-            "CFDB 段边界异常 (offset=$cfdbOffset, len=$cfdbLength, total=${bytes.size})"
-        }
-        require(u32Le(bytes, cfdbOffset) == CFDB_MAGIC) {
-            "缺少 CFDB v3 魔数"
-        }
-
-        val entryCount = u32Le(bytes, cfdbOffset + 4).toInt()
-        require(entryCount in 0..4096) { "CFDB 目录项数量异常 ($entryCount)" }
-        val tableBytes = entryCount.toLong() * CFDB_ENTRY_SIZE.toLong()
-        require(CFDB_HEADER_SIZE + tableBytes <= cfdbLength) {
-            "CFDB 目录表超出段长度"
-        }
+        val doc = CfdbReader.parse(bytes, label = "pdp_cdb", maxEntryCount = 4096)
 
         var overrideSetId: Int? = null
         var clus0Blob: ByteArray? = null
         var clus1Blob: ByteArray? = null
 
-        for (i in 0 until entryCount) {
-            val base = cfdbOffset + CFDB_HEADER_SIZE + i * CFDB_ENTRY_SIZE
-            val hash = u32Le(bytes, base)
-            val valueOrOffset = u32Le(bytes, base + 4)
-            val typeAndSize = u32Le(bytes, base + 8)
-            val type = (typeAndSize and 0xFFu).toInt()
-            val size = (typeAndSize shr 8).toInt()
-
-            when (hash) {
-                HASH_OVERRIDE -> if (type == 0) {
-                    overrideSetId = valueOrOffset.toInt()
+        for (entry in doc.entries) {
+            when (entry.hash) {
+                HASH_OVERRIDE -> if (entry.type == 0) {
+                    overrideSetId = entry.valueOrOffset.toInt()
                 }
-                HASH_CLUS0 -> if (type == 2) {
-                    clus0Blob = sliceBlob(bytes, cfdbOffset, cfdbLength, valueOrOffset, size)
+                HASH_CLUS0 -> if (entry.type == 2) {
+                    clus0Blob = doc.sliceBlob(entry)
                 }
-                HASH_CLUS1 -> if (type == 2) {
-                    clus1Blob = sliceBlob(bytes, cfdbOffset, cfdbLength, valueOrOffset, size)
+                HASH_CLUS1 -> if (entry.type == 2) {
+                    clus1Blob = doc.sliceBlob(entry)
                 }
             }
         }
@@ -184,70 +182,16 @@ object PdpCdbParser {
         )
     }
 
-    private fun locateCfdb(bytes: ByteArray): Pair<Int, Int> {
-        if (u32Le(bytes, 0) == CFDB_MAGIC) {
-            return 0 to bytes.size
-        }
-
-        require(
-            bytes.size >= 52 &&
-                bytes[0] == 0x7F.toByte() &&
-                bytes[1] == 'E'.code.toByte() &&
-                bytes[2] == 'L'.code.toByte() &&
-                bytes[3] == 'F'.code.toByte() &&
-                bytes[4] == 1.toByte() &&
-                bytes[5] == 1.toByte(),
-        ) {
-            "无法识别的 pdp_cdb 格式（非 ELF32 LE 且非 CFDB）"
-        }
-
-        val phoff = u32Le(bytes, 28).toLong()
-        val phentsize = u16Le(bytes, 42)
-        val phnum = u16Le(bytes, 44)
-        require(phentsize >= 32 && phoff >= 0 && phoff + phnum.toLong() * phentsize <= bytes.size) {
-            "ELF32 Program Header 越界"
-        }
-
-        for (i in 0 until phnum) {
-            val ph = (phoff + i.toLong() * phentsize).toInt()
-            val pType = u32Le(bytes, ph)
-            if (pType != 1u) continue // PT_LOAD
-            val offset = u32Le(bytes, ph + 4).toLong()
-            val filesz = u32Le(bytes, ph + 16).toLong()
-            if (offset < 0 || filesz < CFDB_HEADER_SIZE || offset + filesz > bytes.size) continue
-            val offInt = offset.toInt()
-            if (u32Le(bytes, offInt) == CFDB_MAGIC) {
-                return offInt to filesz.toInt()
-            }
-        }
-        throw IllegalArgumentException("ELF32 中未找到包含 CFDB v3 的 PT_LOAD 段")
-    }
-
-    private fun sliceBlob(
-        bytes: ByteArray,
-        cfdbOffset: Int,
-        cfdbLength: Int,
-        relOffset: UInt,
-        size: Int,
-    ): ByteArray {
-        val rel = relOffset.toLong()
-        require(size >= 0 && rel >= 0 && rel + size <= cfdbLength) {
-            "CFDB Blob 越界 (rel=$rel, size=$size, cfdbLength=$cfdbLength)"
-        }
-        val start = cfdbOffset + rel.toInt()
-        return bytes.copyOfRange(start, start + size)
-    }
-
     private fun parseRecords(blob: ByteArray): List<RawVoltageRecord> {
         val out = mutableListOf<RawVoltageRecord>()
         var pos = 0
         while (pos + RECORD_SIZE <= blob.size) {
-            val setId = u32Le(blob, pos).toInt()
+            val setId = CfdbReader.u32Le(blob, pos).toInt()
             if (setId == 0) break
             val modeCode = blob[pos + 4].toInt() and 0xFF
-            val value = u32Le(blob, pos + 5).toLong()
-            val cxMv = i16Le(blob, pos + 9)
-            val mxMv = i16Le(blob, pos + 11)
+            val value = CfdbReader.u32Le(blob, pos + 5).toLong()
+            val cxMv = CfdbReader.i16Le(blob, pos + 9)
+            val mxMv = CfdbReader.i16Le(blob, pos + 11)
             out += RawVoltageRecord(
                 setId = setId,
                 mode = AdjustMode.fromCode(modeCode),
@@ -320,16 +264,4 @@ object PdpCdbParser {
             maxMxMv = maxMx,
         )
     }
-
-    private fun u16Le(bytes: ByteArray, offset: Int): Int =
-        (bytes[offset].toInt() and 0xFF) or ((bytes[offset + 1].toInt() and 0xFF) shl 8)
-
-    private fun i16Le(bytes: ByteArray, offset: Int): Int =
-        (bytes[offset].toInt() and 0xFF) or (bytes[offset + 1].toInt() shl 8)
-
-    private fun u32Le(bytes: ByteArray, offset: Int): UInt =
-        (bytes[offset].toUByte().toUInt()) or
-            (bytes[offset + 1].toUByte().toUInt() shl 8) or
-            (bytes[offset + 2].toUByte().toUInt() shl 16) or
-            (bytes[offset + 3].toUByte().toUInt() shl 24)
 }

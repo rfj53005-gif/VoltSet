@@ -11,8 +11,8 @@ android {
         applicationId = "io.voltset.sm8850"
         minSdk = 30
         targetSdk = 36
-        versionCode = providers.gradleProperty("releaseVersionCode").orElse("2").get().toInt()
-        versionName = providers.gradleProperty("releaseVersionName").orElse("0.2.0").get()
+        versionCode = providers.gradleProperty("releaseVersionCode").orElse("6").get().toInt()
+        versionName = providers.gradleProperty("releaseVersionName").orElse("0.3.3").get()
     }
 
     buildTypes {
@@ -68,4 +68,5 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.10.0")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui-tooling-preview")
+    testImplementation("junit:junit:4.13.2")
 }

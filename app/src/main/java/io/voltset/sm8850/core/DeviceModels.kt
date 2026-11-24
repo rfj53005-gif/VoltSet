@@ -9,12 +9,9 @@ enum class BaselineSource {
 
 /** Immediate readback after writing `set_overrides`. */
 data class OverrideWriteResult(
-    val bootId: String,
-    val bootCpussIndex: Int,
     val sdamCpussIndex: Int,
     val sdamGlobalIndex: Int,
     val reg7151Hex: String?,
-    val writtenDecimal: Int,
 )
 
 /** Complete runtime snapshot returned by `voltset.sh status` and parsed in Kotlin. */
@@ -31,26 +28,33 @@ data class DeviceSnapshot(
     val adjAvailable: Boolean,
     val adjSetNodePresent: Boolean,
     val adjError: String?,
-    val bootCpussIndex: Int?,
+    val bootSet: BootSetStatus,
     val sdamCpussIndex: Int?,
     val sdamGlobalIndex: Int?,
     val reg7151Hex: String?,
     val pdpCdbPath: String?,
     val pdpCdb: PdpCdbData?,
     val pdpCdbError: String?,
+    val pdpFwPath: String?,
+    val pdpHardwareLimits: PdpHardwareLimits?,
+    val pdpFwError: String?,
     val cdtPath: String?,
     val cdtStatus: CdtStatus,
     val scmiModuleAsset: String?,
     val scmiError: String?,
     val scmiPoints: List<ScmiPoint>,
+    val qualityReport: ScmiQualityReport?,
     val baselineSource: BaselineSource,
     val baselinePoints: List<ScmiPoint>?,
     val voltageDiffRows: List<VoltageDiffRow>,
+    val setEstimates: Map<Int, SetDeviceEstimate>,
     val compatibility: CompatibilityReport,
 ) {
-    /** True when SDAM holds a different Set index than the one booted on this boot_id. */
-    val pendingReboot: Boolean
-        get() = bootCpussIndex != null && sdamCpussIndex != null && bootCpussIndex != sdamCpussIndex
+    val bootCpussIndex: Int? get() = bootSet.runningIndex
+
+    val pendingSetIndex: Int? get() = bootSet.pendingIndex(sdamCpussIndex)
+
+    val pendingReboot: Boolean get() = pendingSetIndex != null
 
     /** Effective Set profile currently running on CPU hardware (based on bootCpussIndex). */
     val activeBootSet: VoltageSetProfile?
@@ -68,9 +72,15 @@ data class DeviceSnapshot(
     val overrideLockedByFirmware: Boolean
         get() = (pdpCdb?.overrideSetId ?: 0) != 0
 
+    fun canSelectSet(setId: Int): Boolean =
+        canWriteOverrides && sdamCpussIndex != null && sdamGlobalIndex != null &&
+            !overrideLockedByFirmware && setId != sdamCpussIndex &&
+            (setId == 1 || (compatibility.level != CompatibilityLevel.UNSUPPORTED &&
+                pdpCdb?.sets?.any { it.setId == setId } == true))
+
     /** Safe conditions under which live SCMI snapshot represents true unmodified stock mV. */
     val canSaveStockBaseline: Boolean
-        get() = bootCpussIndex == 1 &&
+        get() = bootCpussIndex == 1 && bootSet.firstSdamIndex == 1 && !bootSet.rebootReadbackMismatch &&
             !cdtStatus.key7Enabled &&
             (cdtStatus.state == CdtState.EMPTY || cdtStatus.state == CdtState.STOCK) &&
             (pdpCdb?.overrideSetId == null || pdpCdb.overrideSetId == 0 || pdpCdb.overrideSetId == 1) &&

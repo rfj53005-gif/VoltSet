@@ -3,6 +3,7 @@ package io.voltset.sm8850
 import android.content.Context
 import android.util.Base64
 import io.voltset.sm8850.core.BaselineSource
+import io.voltset.sm8850.core.BootSetStatus
 import io.voltset.sm8850.core.CdtInspector
 import io.voltset.sm8850.core.CompatibilityChecker
 import io.voltset.sm8850.core.CompatibilityInput
@@ -10,9 +11,17 @@ import io.voltset.sm8850.core.DeviceSnapshot
 import io.voltset.sm8850.core.OverrideWriteResult
 import io.voltset.sm8850.core.PdpCdbData
 import io.voltset.sm8850.core.PdpCdbParser
+import io.voltset.sm8850.core.PdpFirmwareParser
+import io.voltset.sm8850.core.PdpHardwareLimits
 import io.voltset.sm8850.core.ScmiPlanParser
+import io.voltset.sm8850.core.ScmiQualityReport
+import io.voltset.sm8850.core.VoltageSetEstimator
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.TimeUnit
+import java.util.zip.GZIPInputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
@@ -60,14 +69,14 @@ internal class RootBackend(private val context: Context) {
         }
     }
 
-    suspend fun readStatus(): DeviceSnapshot {
-        val output = execute(listOf("status"))
-        return parseStatusOutput(output)
+    suspend fun readStatus(): DeviceSnapshot = withContext(Dispatchers.IO) {
+        parseStatusOutput(execute(listOf("status")))
     }
 
     suspend fun applySet(
         bootId: String,
         cpussIndex: Int,
+        expectedCpussIndex: Int,
         globalIndex: Int,
     ): OverrideWriteResult {
         val output = execute(
@@ -75,50 +84,58 @@ internal class RootBackend(private val context: Context) {
                 "set_override",
                 bootId,
                 cpussIndex.toString(),
+                expectedCpussIndex.toString(),
                 globalIndex.toString(),
             ),
         )
-        val kv = parseKeyValues(output)
+        val kv = BackendOutput(output).values
         return OverrideWriteResult(
-            bootId = kv["BOOT_ID"] ?: bootId,
-            bootCpussIndex = kv["BOOT_CPUSS_IDX"]?.toIntOrNull()
-                ?: error("未返回当前启动 Set 索引"),
             sdamCpussIndex = kv["SDAM_CPUSS_IDX"]?.toIntOrNull()
                 ?: error("未返回写后 SDAM Set 索引"),
             sdamGlobalIndex = kv["SDAM_GLOBAL_IDX"]?.toIntOrNull()
                 ?: error("未返回写后 Global Set 索引"),
             reg7151Hex = kv["REG_7151"]?.takeIf { it != "unavailable" },
-            writtenDecimal = kv["WRITTEN_DEC"]?.toIntOrNull() ?: ((cpussIndex shl 4) or globalIndex),
         )
     }
 
     suspend fun saveBaseline(bootId: String): String {
         val output = execute(listOf("save_baseline", bootId))
-        return extractBlock(output, "BASELINE_BEGIN", "BASELINE_END")
+        return BackendOutput(output).blocks["BASELINE"]
             ?: error("未能取回已保存的原厂基线内容")
     }
 
-    suspend fun reboot(bootId: String) {
-        execute(listOf("reboot", bootId))
+    suspend fun reboot(bootId: String, expectedCpussIndex: Int, globalIndex: Int) {
+        execute(listOf("reboot", bootId, expectedCpussIndex.toString(), globalIndex.toString()))
     }
 
     private suspend fun execute(args: List<String>): String = withContext(Dispatchers.IO) {
-        val command = listOf("/system/bin/sh", File(bundle, "voltset.sh").path, bundle.path) + args
+        val command = listOf(
+            "/system/bin/timeout", "-k", "2s", "20s",
+            "/system/bin/sh", File(bundle, "voltset.sh").path, bundle.path,
+        ) + args
         val quoted = command.joinToString(" ") { shellQuote(it) }
-        val process = try {
-            ProcessBuilder("su", "-c", quoted)
-                .redirectErrorStream(true)
-                .start()
-        } catch (e: IOException) {
-            throw IllegalStateException("无法启动 Root 权限请求，请确认设备已 Root 并授权", e)
-        }
-
+        val outputFile = File.createTempFile("voltset-", ".log", context.cacheDir)
         try {
-            process.outputStream.close()
-            val output = runInterruptible {
-                process.inputStream.bufferedReader().use { it.readText() }
+            val process = try {
+                ProcessBuilder("su", "-c", quoted)
+                    .redirectErrorStream(true)
+                    .redirectOutput(outputFile)
+                    .start()
+            } catch (e: IOException) {
+                throw IllegalStateException("无法启动 Root 请求，请检查 KernelSU 或 Magisk 授权", e)
             }
-            val exitCode = runInterruptible { process.waitFor() }
+            val exitCode = try {
+                process.outputStream.close()
+                check(runInterruptible { process.waitFor(30, TimeUnit.SECONDS) }) {
+                    "Root 请求超时，请检查授权后刷新"
+                }
+                process.exitValue()
+            } finally {
+                if (process.isAlive) process.destroyForcibly()
+            }
+            check(exitCode != 124 && exitCode != 137) { "读取或执行超时，请刷新后重试" }
+            check(outputFile.length() <= MAX_BACKEND_OUTPUT_BYTES) { "Root 后端返回的数据超出预期" }
+            val output = outputFile.readText()
             if (exitCode != 0) {
                 val errors = output.lineSequence()
                     .filter { it.startsWith("ERROR ") }
@@ -126,20 +143,21 @@ internal class RootBackend(private val context: Context) {
                     .filter { it.isNotEmpty() }
                     .toList()
                 val msg = errors.joinToString("\n").ifBlank {
-                    output.trim().takeLast(600).ifBlank {
-                        "Root 后端执行失败 (exit=$exitCode)，请检查 KernelSU/Magisk 授权"
-                    }
+                    val detail = output.trim().takeLast(400)
+                    "Root 后端执行失败，请检查 KernelSU 或 Magisk 授权（$exitCode）" +
+                        detail.takeIf { it.isNotEmpty() }?.let { "\n$it" }.orEmpty()
                 }
                 error(msg)
             }
             output
         } finally {
-            runCatching { process.outputStream.close() }
+            outputFile.delete()
         }
     }
 
     private fun parseStatusOutput(output: String): DeviceSnapshot {
-        val kv = parseKeyValues(output)
+        val reply = BackendOutput(output)
+        val kv = reply.values
         val bootId = kv["BOOT_ID"] ?: error("后端未返回启动 ID")
         val socModel = kv["SOC_MODEL"] ?: "unknown"
         val deviceModel = kv["DEVICE_MODEL"] ?: "unknown"
@@ -154,7 +172,6 @@ internal class RootBackend(private val context: Context) {
         val adjSetNodePresent = kv["ADJ_SET_NODE"] == "1"
         val debugfsPath = kv["DEBUGFS"]?.takeIf { it != "none" }
         val adjError = kv["ADJ_ERROR"]
-        val bootCpussIndex = kv["BOOT_CPUSS_IDX"]?.toIntOrNull()
         val sdamCpussIndex = kv["SDAM_CPUSS_IDX"]?.toIntOrNull()
         val sdamGlobalIndex = kv["SDAM_GLOBAL_IDX"]?.toIntOrNull()
         val reg7151Hex = kv["REG_7151"]?.takeIf { it.isNotBlank() && it != "unavailable" }
@@ -162,10 +179,9 @@ internal class RootBackend(private val context: Context) {
 
         var pdpCdb: PdpCdbData? = null
         var pdpCdbError = kv["PDP_CDB_ERROR"]
-        val pdpB64 = extractBlock(output, "PDP_CDB_B64_BEGIN", "PDP_CDB_B64_END")
-        if (pdpB64 != null) {
+        if (reply.blocks["PDP_CDB_GZB64"] != null || reply.blocks["PDP_CDB_B64"] != null) {
             runCatching {
-                val bytes = Base64.decode(pdpB64, Base64.DEFAULT)
+                val bytes = checkNotNull(decodeBlockBytes(reply, "PDP_CDB_GZB64", "PDP_CDB_B64"))
                 PdpCdbParser.parse(bytes)
             }.onSuccess {
                 pdpCdb = it
@@ -176,30 +192,71 @@ internal class RootBackend(private val context: Context) {
             pdpCdbError = "未找到 pdp_cdb 分区"
         }
 
-        val cdtBytes = extractBlock(output, "CDT_B64_BEGIN", "CDT_B64_END")?.let { b64 ->
+        val cdtBytes = reply.blocks["CDT_B64"]?.let { b64 ->
             runCatching { Base64.decode(b64, Base64.DEFAULT) }.getOrNull()
         }
         val cdtStatus = CdtInspector.inspect(cdtBytes)
 
-        val scmiError = if (kv["SCMI_STATUS"] == "ok") null else kv["SCMI_ERROR"] ?: "读取 SCMI 失败"
-        val scmiCsv = extractBlock(output, "SCMI_BEGIN", "SCMI_END")
-        val scmiPoints = if (scmiCsv != null) {
-            ScmiPlanParser.parseCsv(scmiCsv, isSm8850)
-        } else {
-            emptyList()
+        val bootSet = BootSetStatus(
+            firstSdamIndex = kv["FIRST_SDAM_IDX"]?.toIntOrNull()?.takeIf { it in 0..7 },
+            previousTargetIndex = kv["PREVIOUS_TARGET_IDX"]?.toIntOrNull()?.takeIf { it in 1..7 },
+            stagedThisBootIndex = kv["STAGED_THIS_BOOT_IDX"]?.toIntOrNull()?.takeIf { it in 1..7 },
+            firmwareIndex = pdpCdb?.overrideSetId?.takeIf { it in 1..7 },
+        )
+        val initialPoints = reply.blocks["SCMI"]?.let { ScmiPlanParser.parseCsv(it, isSm8850) }.orEmpty()
+        val qualityReport = reply.blocks["SCMI_RECHECK"]?.let { csv ->
+            ScmiQualityReport.evaluate(initialPoints, ScmiPlanParser.parseCsv(csv, isSm8850))
+        }
+        val scmiPoints = qualityReport?.points ?: initialPoints
+        val scmiError = when {
+            kv["SCMI_STATUS"] != "ok" -> kv["SCMI_ERROR"]?.takeIf { it.isNotBlank() } ?: "读取 SCMI 失败"
+            scmiPoints.isEmpty() -> "SCMI 快照没有可解析的 CPU 频点"
+            else -> null
         }
 
-        val baselineSource = when (kv["BASELINE_SOURCE"]) {
+        val baselinePoints = reply.blocks["BASELINE"]?.let {
+            ScmiPlanParser.parseCsv(it, isSm8850, qualityReport?.coefficients.orEmpty())
+        }?.takeIf { it.isNotEmpty() }
+        val baselineSource = when (kv["BASELINE_SOURCE"].takeIf { baselinePoints != null }) {
             "voltset" -> BaselineSource.VOLTSET
             "suntuner" -> BaselineSource.SUNTUNER
             else -> BaselineSource.NONE
         }
-        val baselineCsv = extractBlock(output, "BASELINE_BEGIN", "BASELINE_END")
-        val baselinePoints = baselineCsv?.let { ScmiPlanParser.parseCsv(it, isSm8850) }
-            ?.takeIf { it.isNotEmpty() }
-
-        val activeSet = bootCpussIndex?.let { id -> pdpCdb?.sets?.firstOrNull { it.setId == id } }
+        val activeSet = bootSet.runningIndex?.let { id -> pdpCdb?.sets?.firstOrNull { it.setId == id } }
         val diffRows = ScmiPlanParser.diff(scmiPoints, baselinePoints, activeSet)
+
+        val pdpFwPath = kv["PDP_FW_PATH"]?.takeIf { it != "none" }
+        var pdpFwError = kv["PDP_FW_ERROR"]
+        var pdpHardwareLimits: PdpHardwareLimits? = null
+        if (reply.blocks["PDP_FW_GZB64"] != null || reply.blocks["PDP_FW_B64"] != null) {
+            runCatching {
+                val bytes = checkNotNull(decodeBlockBytes(reply, "PDP_FW_GZB64", "PDP_FW_B64"))
+                PdpFirmwareParser.parse(bytes)
+            }.onSuccess { tables ->
+                val matched = PdpFirmwareParser.matchDeviceLimits(tables, baselinePoints, scmiPoints)
+                pdpHardwareLimits = matched
+                if (!matched.isComplete && pdpFwError == null) {
+                    pdpFwError = when {
+                        baselinePoints.isNullOrEmpty() && scmiPoints.isEmpty() ->
+                            "缺少 SCMI 频点列表，无法匹配对应体质档位的 pdp 硬件限位表"
+                        matched.clus0 == null && matched.clus1 == null ->
+                            "未能在 pdp（${tables.size} 张表）中唯一匹配到双簇频点对应的硬件限位"
+                        matched.clus0 == null -> "未能在 pdp 中唯一匹配到小核 PDP0 硬件限位"
+                        else -> "未能在 pdp 中唯一匹配到大核 PDP1 硬件限位"
+                    }
+                }
+            }.onFailure { err ->
+                pdpFwError = err.message ?: "pdp 固件表解析失败"
+            }
+        } else if (kv["PDP_FW_PATH"] == "none" && pdpFwError == null) {
+            pdpFwError = "未找到 pdp 分区"
+        }
+
+        val setEstimates = VoltageSetEstimator.estimateAll(
+            sets = pdpCdb?.sets.orEmpty(),
+            baselinePoints = baselinePoints,
+            limits = pdpHardwareLimits,
+        )
 
         val compatibility = CompatibilityChecker.evaluate(
             CompatibilityInput(
@@ -216,6 +273,9 @@ internal class RootBackend(private val context: Context) {
                 pdpCdbPath = pdpCdbPath,
                 pdpCdb = pdpCdb,
                 pdpCdbError = pdpCdbError,
+                pdpFwPath = pdpFwPath,
+                pdpHardwareLimits = pdpHardwareLimits,
+                pdpFwError = pdpFwError,
                 cdtStatus = cdtStatus,
                 scmiModuleAsset = scmiModuleAsset,
                 scmiError = scmiError,
@@ -236,57 +296,86 @@ internal class RootBackend(private val context: Context) {
             adjAvailable = adjAvailable,
             adjSetNodePresent = adjSetNodePresent,
             adjError = adjError,
-            bootCpussIndex = bootCpussIndex,
+            bootSet = bootSet,
             sdamCpussIndex = sdamCpussIndex,
             sdamGlobalIndex = sdamGlobalIndex,
             reg7151Hex = reg7151Hex,
             pdpCdbPath = pdpCdbPath,
             pdpCdb = pdpCdb,
             pdpCdbError = pdpCdbError,
+            pdpFwPath = pdpFwPath,
+            pdpHardwareLimits = pdpHardwareLimits,
+            pdpFwError = pdpFwError,
             cdtPath = kv["CDT_PATH"]?.takeIf { it != "none" },
             cdtStatus = cdtStatus,
             scmiModuleAsset = scmiModuleAsset,
             scmiError = scmiError,
             scmiPoints = scmiPoints,
+            qualityReport = qualityReport,
             baselineSource = baselineSource,
             baselinePoints = baselinePoints,
             voltageDiffRows = diffRows,
+            setEstimates = setEstimates,
             compatibility = compatibility,
         )
     }
 
-    private fun parseKeyValues(output: String): Map<String, String> {
-        val result = linkedMapOf<String, String>()
-        var insideBlock = false
-        for (rawLine in output.lineSequence()) {
-            val line = rawLine.trimEnd('\r')
-            if (line.endsWith("_BEGIN")) {
-                insideBlock = true
-                continue
-            }
-            if (line.endsWith("_END")) {
-                insideBlock = false
-                continue
-            }
-            if (insideBlock) continue
-            val eq = line.indexOf('=')
-            if (eq > 0) {
-                val key = line.substring(0, eq)
-                val value = line.substring(eq + 1)
-                result[key] = value
+    private class BackendOutput(output: String) {
+        val values = mutableMapOf<String, String>()
+        val blocks = mutableMapOf<String, String>()
+
+        init {
+            var block: String? = null
+            val content = StringBuilder()
+            for (line in output.lineSequence()) {
+                val activeBlock = block
+                if (activeBlock != null) {
+                    if (line == "${activeBlock}_END") {
+                        blocks[activeBlock] = content.toString()
+                        content.clear()
+                        block = null
+                    } else {
+                        content.appendLine(line)
+                    }
+                } else {
+                    val equals = line.indexOf('=')
+                    if (equals > 0) {
+                        values[line.substring(0, equals)] = line.substring(equals + 1)
+                    } else if (line.endsWith("_BEGIN")) {
+                        block = line.removeSuffix("_BEGIN")
+                    }
+                }
             }
         }
-        return result
     }
 
-    private fun extractBlock(output: String, beginMarker: String, endMarker: String): String? {
-        val lines = output.lineSequence().map { it.trimEnd('\r') }.toList()
-        val startIdx = lines.indexOf(beginMarker)
-        if (startIdx < 0) return null
-        val endIdx = lines.drop(startIdx + 1).indexOf(endMarker)
-        if (endIdx < 0) return null
-        return lines.subList(startIdx + 1, startIdx + 1 + endIdx).joinToString("\n")
+    private fun decodeBlockBytes(reply: BackendOutput, gzKey: String, rawKey: String): ByteArray? {
+        reply.blocks[gzKey]?.let { b64 ->
+            val compressed = Base64.decode(b64, Base64.DEFAULT)
+            ByteArrayInputStream(compressed).use { rawIn ->
+                GZIPInputStream(rawIn).use { gz ->
+                    val out = ByteArrayOutputStream()
+                    val buf = ByteArray(8192)
+                    var total = 0
+                    while (true) {
+                        val n = gz.read(buf)
+                        if (n < 0) break
+                        total += n
+                        check(total <= MAX_PARTITION_BYTES) { "解压分区数据超出上限 ($MAX_PARTITION_BYTES B)" }
+                        out.write(buf, 0, n)
+                    }
+                    return out.toByteArray()
+                }
+            }
+        }
+        val rawB64 = reply.blocks[rawKey] ?: return null
+        return Base64.decode(rawB64, Base64.DEFAULT)
     }
 
     private fun shellQuote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
+
+    companion object {
+        private const val MAX_BACKEND_OUTPUT_BYTES = 4 * 1024 * 1024
+        private const val MAX_PARTITION_BYTES = 4 * 1024 * 1024
+    }
 }

@@ -8,7 +8,9 @@ import io.voltset.sm8850.core.ClusterSetSummary
 import io.voltset.sm8850.core.CompatibilityChecker
 import io.voltset.sm8850.core.DeviceSnapshot
 import io.voltset.sm8850.core.ScmiPlanParser
+import io.voltset.sm8850.core.VoltageSetEstimator
 import io.voltset.sm8850.core.VoltageSetProfile
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -22,7 +24,7 @@ enum class VoltSetTab {
 }
 
 internal data class VoltSetUiState(
-    val loading: Boolean = true,
+    val loading: Boolean = false,
     val busyAction: String? = null,
     val error: String? = null,
     val snapshot: DeviceSnapshot? = null,
@@ -34,6 +36,7 @@ internal data class VoltSetUiState(
     val showRebootConfirm: Boolean = false,
 ) {
     val busy: Boolean get() = loading || busyAction != null
+    val controlsEnabled: Boolean get() = snapshot != null && !busy && error == null
 }
 
 internal class VoltSetViewModel(application: Application) : AndroidViewModel(application) {
@@ -41,15 +44,13 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
     private val _state = MutableStateFlow(VoltSetUiState())
     val state: StateFlow<VoltSetUiState> = _state.asStateFlow()
 
-    init {
-        refresh()
-    }
-
     fun refresh() {
-        if (_state.value.busyAction != null) return
+        if (_state.value.busy) return
+        _state.update {
+            it.copy(loading = true, error = null, pendingConfirmSet = null, showRebootConfirm = false)
+        }
         viewModelScope.launch {
-            _state.update { it.copy(loading = true, error = null) }
-            runCatching {
+            attempt {
                 val initial = backend.readStatus()
                 maybeAutoSaveBaseline(initial)
             }.onSuccess { snap ->
@@ -75,20 +76,21 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
         if (!snap.canSaveStockBaseline || snap.baselineSource == BaselineSource.VOLTSET) {
             return snap
         }
-        return runCatching {
-            val savedCsv = backend.saveBaseline(snap.bootId)
-            val parsedBaseline = ScmiPlanParser.parseCsv(savedCsv, snap.isSm8850)
-            if (parsedBaseline.isEmpty()) return snap
-            snap.copy(
-                baselineSource = BaselineSource.VOLTSET,
-                baselinePoints = parsedBaseline,
-                voltageDiffRows = ScmiPlanParser.diff(
-                    snap.scmiPoints,
-                    parsedBaseline,
-                    snap.activeBootSet,
-                ),
-            )
-        }.getOrDefault(snap)
+        return attempt { saveBaseline(snap) }.getOrDefault(snap)
+    }
+
+    private suspend fun saveBaseline(snap: DeviceSnapshot): DeviceSnapshot {
+        val csv = backend.saveBaseline(snap.bootId)
+        val points = ScmiPlanParser.parseCsv(csv, snap.isSm8850, snap.qualityReport?.coefficients.orEmpty())
+        check(points.any { it.domain == 0 } && points.any { it.domain == 1 }) { "原厂基线缺少完整的 CPU 集群数据" }
+        val estimates = VoltageSetEstimator.estimateAll(snap.pdpCdb?.sets.orEmpty(), points, snap.pdpHardwareLimits)
+        val updated = snap.copy(
+            baselineSource = BaselineSource.VOLTSET,
+            baselinePoints = points,
+            voltageDiffRows = ScmiPlanParser.diff(snap.scmiPoints, points, snap.activeBootSet),
+            setEstimates = estimates,
+        )
+        return updated.copy(compatibility = CompatibilityChecker.evaluateSnapshot(updated))
     }
 
     fun selectTab(tab: VoltSetTab) {
@@ -111,7 +113,8 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
     }
 
     fun requestApplySet(profile: VoltageSetProfile) {
-        if (_state.value.busy) return
+        val current = _state.value
+        if (!current.controlsEnabled || current.snapshot?.canSelectSet(profile.setId) != true) return
         _state.update { it.copy(pendingConfirmSet = profile) }
     }
 
@@ -130,41 +133,34 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
     }
 
     fun confirmApplySet() {
-        val snap = _state.value.snapshot ?: return
-        val target = _state.value.pendingConfirmSet ?: return
-        if (_state.value.busy) return
-
-        val globalIdx = snap.sdamGlobalIndex ?: 1
+        val current = _state.value
+        val snap = current.snapshot ?: return
+        val target = current.pendingConfirmSet ?: return
+        if (!current.controlsEnabled || !snap.canSelectSet(target.setId)) return
+        val cpussIdx = snap.sdamCpussIndex ?: return
+        val globalIdx = snap.sdamGlobalIndex ?: return
+        _state.update {
+            it.copy(pendingConfirmSet = null, busyAction = "正在写入 Set ${target.setId}…")
+        }
         viewModelScope.launch {
-            _state.update {
-                it.copy(
-                    pendingConfirmSet = null,
-                    busyAction = "正在写入 Set ${target.setId}...",
-                    error = null,
-                )
-            }
-            runCatching {
-                backend.applySet(snap.bootId, target.setId, globalIdx)
+            attempt {
+                backend.applySet(snap.bootId, target.setId, cpussIdx, globalIdx)
             }.onSuccess { result ->
-                val hexDisplay = result.reg7151Hex?.uppercase()?.let { "0x$it" } ?: "未知"
-                val message = if (result.bootCpussIndex != result.sdamCpussIndex) {
-                    "已写入 Set ${result.sdamCpussIndex}（0x7151=$hexDisplay），重启手机后生效"
+                val updated = snap.copy(
+                    bootSet = snap.bootSet.copy(stagedThisBootIndex = result.sdamCpussIndex),
+                    sdamCpussIndex = result.sdamCpussIndex,
+                    sdamGlobalIndex = result.sdamGlobalIndex,
+                    reg7151Hex = result.reg7151Hex,
+                )
+                val message = if (updated.pendingReboot) {
+                    "已写入 Set ${result.sdamCpussIndex}，下次开机核对"
                 } else {
-                    "已写入 Set ${result.sdamCpussIndex}（0x7151=$hexDisplay），与当前运行档位一致"
+                    "SDAM 已读回 Set ${result.sdamCpussIndex}"
                 }
-                _state.update { current ->
-                    val updatedSnap = current.snapshot?.let { cur ->
-                        val nextSnap = cur.copy(
-                            bootCpussIndex = result.bootCpussIndex,
-                            sdamCpussIndex = result.sdamCpussIndex,
-                            sdamGlobalIndex = result.sdamGlobalIndex,
-                            reg7151Hex = result.reg7151Hex,
-                        )
-                        nextSnap.copy(compatibility = CompatibilityChecker.evaluateSnapshot(nextSnap))
-                    }
-                    current.copy(
+                _state.update {
+                    it.copy(
                         busyAction = null,
-                        snapshot = updatedSnap,
+                        snapshot = updated.copy(compatibility = CompatibilityChecker.evaluateSnapshot(updated)),
                         snackbarMessage = message,
                     )
                 }
@@ -172,7 +168,7 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
                 _state.update {
                     it.copy(
                         busyAction = null,
-                        snackbarMessage = err.message ?: "写入 Set 档位失败",
+                        error = err.message ?: "写入结果未确认，请刷新核对",
                     )
                 }
             }
@@ -180,34 +176,17 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
     }
 
     fun captureStockBaseline() {
-        val snap = _state.value.snapshot ?: return
-        if (_state.value.busy) return
+        val current = _state.value
+        val snap = current.snapshot ?: return
+        if (!current.controlsEnabled || !snap.canSaveStockBaseline) return
+        _state.update { it.copy(busyAction = "正在采集 Set 1 原厂基线…") }
         viewModelScope.launch {
-            _state.update {
-                it.copy(
-                    busyAction = "正在采集原厂 Set 1 SCMI 基线...",
-                    error = null,
-                )
-            }
-            runCatching {
-                val csv = backend.saveBaseline(snap.bootId)
-                ScmiPlanParser.parseCsv(csv, snap.isSm8850)
-            }.onSuccess { points ->
-                _state.update { current ->
-                    val curSnap = current.snapshot
-                    val updatedSnap = curSnap?.copy(
-                        baselineSource = BaselineSource.VOLTSET,
-                        baselinePoints = points,
-                        voltageDiffRows = ScmiPlanParser.diff(
-                            curSnap.scmiPoints,
-                            points,
-                            curSnap.activeBootSet,
-                        ),
-                    )
-                    current.copy(
+            attempt { saveBaseline(snap) }.onSuccess { updated ->
+                _state.update {
+                    it.copy(
                         busyAction = null,
-                        snapshot = updatedSnap,
-                        snackbarMessage = "已保存原厂 Set 1 基线 (${points.size} 个频点)",
+                        snapshot = updated,
+                        snackbarMessage = "已保存原厂基线（${updated.baselinePoints.orEmpty().size} 个频点）",
                     )
                 }
             }.onFailure { err ->
@@ -222,7 +201,8 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
     }
 
     fun requestReboot() {
-        if (_state.value.busy) return
+        val current = _state.value
+        if (!current.controlsEnabled || current.snapshot?.pendingReboot != true) return
         _state.update { it.copy(showRebootConfirm = true) }
     }
 
@@ -231,21 +211,22 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
     }
 
     fun confirmReboot() {
-        val snap = _state.value.snapshot ?: return
+        val current = _state.value
+        val snap = current.snapshot ?: return
+        if (!current.controlsEnabled || !current.showRebootConfirm) return
+        val target = snap.pendingSetIndex ?: return
+        val globalIdx = snap.sdamGlobalIndex ?: return
+        _state.update { it.copy(showRebootConfirm = false, busyAction = "正在请求重启…") }
         viewModelScope.launch {
-            _state.update {
-                it.copy(
-                    showRebootConfirm = false,
-                    busyAction = "正在重启设备...",
-                )
-            }
-            runCatching {
-                backend.reboot(snap.bootId)
+            attempt {
+                backend.reboot(snap.bootId, target, globalIdx)
+            }.onSuccess {
+                _state.update { it.copy(busyAction = null, snackbarMessage = "已请求重启") }
             }.onFailure { err ->
                 _state.update {
                     it.copy(
                         busyAction = null,
-                        snackbarMessage = err.message ?: "触发重启失败",
+                        error = err.message ?: "重启请求失败，请刷新后重试",
                     )
                 }
             }
@@ -258,5 +239,13 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
 
     fun consumeSnackbar() {
         _state.update { it.copy(snackbarMessage = null) }
+    }
+
+    private suspend fun <T> attempt(block: suspend () -> T): Result<T> = try {
+        Result.success(block())
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        Result.failure(error)
     }
 }

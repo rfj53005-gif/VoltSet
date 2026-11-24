@@ -11,6 +11,7 @@ shift 2
 root=/data/adb/voltset
 persistent=$root/persistent
 session=$root/session
+last_set=$persistent/last-set
 suntuner_baseline=/data/adb/sm8750-tuner/persistent/stock-baseline.csv
 modules=/sys/module
 boot_file=/proc/sys/kernel/random/boot_id
@@ -65,12 +66,12 @@ kernel_page_size() {
 
 scmi_module_asset() {
     local directory=sm8750 pages asset
+    pages=$(kernel_page_size) || return 1
+    [ "$pages" = 4096 ] || return 1
     if is_sm8850; then
         directory=sm8850/android16-6-4k
         case "$(uname -r)" in
             6.12.*-android16-5-*)
-                pages=$(kernel_page_size) || return 1
-                [ "$pages" = 4096 ] || return 1
                 directory=sm8850/android16-5-4k
                 ;;
         esac
@@ -81,7 +82,7 @@ scmi_module_asset() {
 }
 
 read_scmi_to_file() {
-    local out_file=$1 asset driver snap
+    local out_file=$1 check_file=${2:-} asset driver snap
     [ -d /sys/bus/scmi_protocol ] || {
         printf '缺少 /sys/bus/scmi_protocol 接口\n' >&2
         return 1
@@ -124,6 +125,9 @@ read_scmi_to_file() {
         unload_scmi || true
         printf '读取 SCMI snapshot 失败\n' >&2
         return 1
+    fi
+    if [ -n "$check_file" ] && is_sm8850 && ! cat "$snap" > "$check_file"; then
+        rm -f -- "$check_file"
     fi
     unload_scmi || {
         printf '卸载 SCMI 读表模块失败\n' >&2
@@ -186,6 +190,11 @@ read_overrides_indices() {
     esac
 }
 
+verify_overrides() {
+    read_overrides_indices "$1" || die "无法核对当前 SDAM 档位，请刷新后重试"
+    [ "$cpuss_idx:$global_idx" = "$2:$3" ] || die "SDAM 档位已变化，请刷新后重新确认"
+}
+
 find_partition_dev() {
     local path
     for path in "/dev/block/by-name/$1" "/dev/block/bootdevice/by-name/$1"; do
@@ -206,6 +215,42 @@ find_pdp_cdb() {
     find_partition_dev pdp_cdb
 }
 
+find_pdp_fw() {
+    local slot
+    slot=$(getprop ro.boot.slot_suffix 2>/dev/null || true)
+    if [ -n "$slot" ] && find_partition_dev "pdp$slot"; then
+        return 0
+    fi
+    find_partition_dev pdp
+}
+
+emit_partition_block() {
+    local dev=$1 blocks=$2 gz_tag=$3 raw_tag=$4 err_key=$5 err_msg=$6
+    local raw_file="$work/$raw_tag.raw"
+    local b64_file="$work/$raw_tag.b64"
+    if ! dd if="$dev" bs=4096 count="$blocks" of="$raw_file" 2>/dev/null || [ ! -s "$raw_file" ]; then
+        rm -f -- "$raw_file"
+        printf '%s=%s\n' "$err_key" "$err_msg"
+        return 0
+    fi
+    if command -v gzip >/dev/null 2>&1 &&
+        gzip -c "$raw_file" > "$raw_file.gz" 2>/dev/null &&
+        [ -s "$raw_file.gz" ] &&
+        base64 < "$raw_file.gz" | tr -d '\n' > "$b64_file" &&
+        [ -s "$b64_file" ]; then
+        printf '%s_BEGIN\n' "$gz_tag"
+        cat "$b64_file"
+        printf '\n%s_END\n' "$gz_tag"
+    elif base64 < "$raw_file" | tr -d '\n' > "$b64_file" && [ -s "$b64_file" ]; then
+        printf '%s_BEGIN\n' "$raw_tag"
+        cat "$b64_file"
+        printf '\n%s_END\n' "$raw_tag"
+    else
+        printf '%s=%s\n' "$err_key" "$err_msg"
+    fi
+    rm -f -- "$raw_file" "$raw_file.gz" "$b64_file"
+}
+
 find_cdt() {
     find_partition_dev cdt
 }
@@ -220,11 +265,24 @@ esac
 mkdir -p "$root" "$persistent"
 chmod 700 "$root" "$persistent"
 exec 9>"$root/lock"
-flock 9 9>&9 || die "无法获取 Root 操作锁"
+flock -n 9 9>&9 || die "另一项 Root 操作正在进行，请稍后重试"
+
+last_set_boot=
+last_set_idx=
+if [ -r "$last_set" ]; then
+    read -r last_set_boot last_set_idx < "$last_set" || last_set_idx=
+    case "$last_set_boot:$last_set_idx" in
+        ????????-????-????-????-????????????:[1-7]) ;;
+        *) last_set_idx= ;;
+    esac
+fi
 
 if [ "$(cat "$session/boot" 2>/dev/null || true)" != "$boot" ]; then
     rm -rf -- "$session"
     mkdir -p "$session"
+    if [ -n "$last_set_idx" ] && [ "$last_set_boot" != "$boot" ]; then
+        printf '%s\n' "$last_set_idx" > "$session/previous-target-idx"
+    fi
     printf '%s\n' "$boot" > "$session/boot"
 fi
 
@@ -252,6 +310,12 @@ case "$action" in
         printf 'KERNEL=%s\n' "$kernel"
         printf 'PAGE_SIZE=%s\n' "$page_size"
         printf 'SCMI_MODULE_ASSET=%s\n' "$scmi_asset"
+        if [ -r "$session/previous-target-idx" ]; then
+            printf 'PREVIOUS_TARGET_IDX=%s\n' "$(cat "$session/previous-target-idx")"
+        fi
+        if [ -n "$last_set_idx" ] && [ "$last_set_boot" = "$boot" ]; then
+            printf 'STAGED_THIS_BOOT_IDX=%s\n' "$last_set_idx"
+        fi
 
         dbg=
         if dbg=$(find_debugfs); then
@@ -266,9 +330,6 @@ case "$action" in
                 if [ ! -f "$session/boot-cpuss-idx" ]; then
                     printf '%s\n' "$cpuss_idx" > "$session/boot-cpuss-idx"
                 fi
-                boot_cpuss_idx=$(cat "$session/boot-cpuss-idx" 2>/dev/null || printf '%s' "$cpuss_idx")
-                case "$boot_cpuss_idx" in [0-7]) ;; *) boot_cpuss_idx=$cpuss_idx ;; esac
-                printf 'BOOT_CPUSS_IDX=%s\n' "$boot_cpuss_idx"
                 printf 'SDAM_CPUSS_IDX=%s\n' "$cpuss_idx"
                 printf 'SDAM_GLOBAL_IDX=%s\n' "$global_idx"
             else
@@ -282,20 +343,25 @@ case "$action" in
             printf 'ADJ_ERROR=未在 debugfs 找到 qcom_voltage_adj 接口\n'
         fi
 
+        if [ -r "$session/boot-cpuss-idx" ]; then
+            printf 'FIRST_SDAM_IDX=%s\n' "$(cat "$session/boot-cpuss-idx")"
+        fi
+
         reg_7151=$(read_reg_7151 "$dbg")
         printf 'REG_7151=%s\n' "$reg_7151"
 
         if pdp_dev=$(find_pdp_cdb); then
             printf 'PDP_CDB_PATH=%s\n' "$pdp_dev"
-            if dd if="$pdp_dev" bs=4096 count=64 2>/dev/null | base64 | tr -d '\n' > "$work/pdp.b64" && [ -s "$work/pdp.b64" ]; then
-                printf 'PDP_CDB_B64_BEGIN\n'
-                cat "$work/pdp.b64"
-                printf '\nPDP_CDB_B64_END\n'
-            else
-                printf 'PDP_CDB_ERROR=读取 pdp_cdb 分区内容失败\n'
-            fi
+            emit_partition_block "$pdp_dev" 256 PDP_CDB_GZB64 PDP_CDB_B64 PDP_CDB_ERROR "读取 pdp_cdb 分区内容失败"
         else
             printf 'PDP_CDB_PATH=none\n'
+        fi
+
+        if pdp_fw_dev=$(find_pdp_fw); then
+            printf 'PDP_FW_PATH=%s\n' "$pdp_fw_dev"
+            emit_partition_block "$pdp_fw_dev" 256 PDP_FW_GZB64 PDP_FW_B64 PDP_FW_ERROR "读取 pdp 分区内容失败"
+        else
+            printf 'PDP_FW_PATH=none\n'
         fi
 
         if cdt_dev=$(find_cdt); then
@@ -311,14 +377,19 @@ case "$action" in
             printf 'CDT_PATH=none\n'
         fi
 
-        if scmi_err=$(read_scmi_to_file "$work/scmi.csv" 2>&1); then
+        if read_scmi_to_file "$work/scmi.csv" "$work/scmi-recheck.csv" 2> "$work/scmi.err"; then
             printf 'SCMI_STATUS=ok\n'
             printf 'SCMI_BEGIN\n'
             awk '1' "$work/scmi.csv"
             printf 'SCMI_END\n'
+            if [ -s "$work/scmi-recheck.csv" ]; then
+                printf 'SCMI_RECHECK_BEGIN\n'
+                awk '1' "$work/scmi-recheck.csv"
+                printf 'SCMI_RECHECK_END\n'
+            fi
         else
             printf 'SCMI_STATUS=error\n'
-            printf 'SCMI_ERROR=%s\n' "$(printf '%s' "$scmi_err" | tr '\n' ' ' | tr -s ' ')"
+            printf 'SCMI_ERROR=%s\n' "$(tr '\n' ' ' < "$work/scmi.err" | tr -s ' ')"
         fi
 
         if [ -s "$persistent/stock-baseline.csv" ]; then
@@ -337,10 +408,11 @@ case "$action" in
         ;;
 
     set_override)
-        [ "$#" = 3 ] || die "set_override 参数数量无效"
+        [ "$#" = 4 ] || die "set_override 参数数量无效"
         [ "$1" = "$boot" ] || die "启动 ID 已改变，请刷新状态后重试"
         target_cpuss=$2
-        target_global=$3
+        expected_cpuss=$3
+        target_global=$4
         case "$target_cpuss" in [1-7]) ;; *) die "CPUSS 档位必须为 1..7" ;; esac
         case "$target_global" in [0-7]) ;; *) die "Global 档位必须为 0..7" ;; esac
 
@@ -348,11 +420,11 @@ case "$action" in
         [ -e "$dbg/qcom_voltage_adj/set_overrides" ] || die "缺少 qcom_voltage_adj/set_overrides 节点"
         [ -r "$dbg/qcom_voltage_adj/get_overrides" ] || die "缺少 qcom_voltage_adj/get_overrides 节点"
 
-        read_overrides_indices "$dbg/qcom_voltage_adj/get_overrides" || die "写入前读取 get_overrides 失败"
+        verify_overrides "$dbg/qcom_voltage_adj/get_overrides" "$expected_cpuss" "$target_global"
         if [ ! -f "$session/boot-cpuss-idx" ]; then
             printf '%s\n' "$cpuss_idx" > "$session/boot-cpuss-idx"
         fi
-        boot_cpuss_idx=$(cat "$session/boot-cpuss-idx" 2>/dev/null || printf '%s' "$cpuss_idx")
+        printf '%s %s\n' "$boot" "$target_cpuss" > "$work/last-set" || die "无法创建档位记录"
 
         dec=$(( (target_cpuss << 4) | target_global ))
         printf '%s\n' "$dec" > "$dbg/qcom_voltage_adj/set_overrides" || die "写入 set_overrides 失败"
@@ -360,26 +432,24 @@ case "$action" in
         read_overrides_indices "$dbg/qcom_voltage_adj/get_overrides" || die "写入后回读 get_overrides 失败"
         [ "$cpuss_idx" = "$target_cpuss" ] && [ "$global_idx" = "$target_global" ] ||
             die "写入校验失败：读回为 CPUSS=$cpuss_idx Global=$global_idx（期望 $target_cpuss/$target_global）"
+        mv "$work/last-set" "$last_set" || die "SDAM 已写入，但无法保存重启核对记录"
 
         reg_7151=$(read_reg_7151 "$dbg")
-        printf 'BOOT_ID=%s\n' "$boot"
-        printf 'BOOT_CPUSS_IDX=%s\n' "$boot_cpuss_idx"
         printf 'SDAM_CPUSS_IDX=%s\n' "$cpuss_idx"
         printf 'SDAM_GLOBAL_IDX=%s\n' "$global_idx"
         printf 'REG_7151=%s\n' "$reg_7151"
-        printf 'WRITTEN_DEC=%s\n' "$dec"
         ;;
 
     save_baseline)
         [ "$#" = 1 ] || die "save_baseline 参数无效"
         [ "$1" = "$boot" ] || die "启动 ID 已改变，请刷新状态"
 
-        if dbg=$(find_debugfs) && read_overrides_indices "$dbg/qcom_voltage_adj/get_overrides"; then
-            boot_idx=$(cat "$session/boot-cpuss-idx" 2>/dev/null || printf '%s' "$cpuss_idx")
-            [ "$boot_idx" = 1 ] || die "当前并非以 Set 1 启动（Set $boot_idx），不能保存为原厂基线"
-        fi
+        boot_idx=$(cat "$session/boot-cpuss-idx" 2>/dev/null || true)
+        prev_idx=$(cat "$session/previous-target-idx" 2>/dev/null || true)
+        [ "$boot_idx" = 1 ] && { [ -z "$prev_idx" ] || [ "$prev_idx" = 1 ]; } ||
+            die "无法确认本次开机为 Set 1，不能保存为原厂基线"
 
-        scmi_err=$(read_scmi_to_file "$work/scmi.csv" 2>&1) || die "$scmi_err"
+        read_scmi_to_file "$work/scmi.csv" 2> "$work/scmi.err" || die "$(cat "$work/scmi.err")"
         grep -q '^0,' "$work/scmi.csv" && grep -q '^1,' "$work/scmi.csv" ||
             die "SCMI 快照缺少 CPU 电压表数据"
 
@@ -403,8 +473,10 @@ case "$action" in
         ;;
 
     reboot)
-        [ "$#" = 1 ] || die "reboot 参数无效"
+        [ "$#" = 3 ] || die "reboot 参数无效"
         [ "$1" = "$boot" ] || die "启动 ID 已改变，请刷新状态"
+        dbg=$(find_debugfs) || die "未找到 debugfs/qcom_voltage_adj 接口"
+        verify_overrides "$dbg/qcom_voltage_adj/get_overrides" "$2" "$3"
         /system/bin/svc power reboot --no-wait
         ;;
 
