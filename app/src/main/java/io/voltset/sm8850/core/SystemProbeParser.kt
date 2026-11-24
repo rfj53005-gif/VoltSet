@@ -17,13 +17,15 @@ data class SystemProbeInfo(
     val scmiDrivers: List<String> = emptyList(),
     val scmiDeviceCount: Int = 0,
     val cpufreqPolicies: List<String> = emptyList(),
+    val energyModelDomains: List<String> = emptyList(),
+    val socInfo: String? = null,
 ) {
     val hasAnyData: Boolean
         get() = adjDirPath != null || regmapNode != null || vadjPlatformDevice != null ||
             vadjModuleLoaded || vadjModuleFiles.isNotEmpty() || debugfsMounts.isNotEmpty() ||
             debugfsVoltNodes.isNotEmpty() || pdpCdtPartitions.isNotEmpty() ||
             byNameDirs.isNotEmpty() || scmiDrivers.isNotEmpty() || scmiDeviceCount > 0 ||
-            cpufreqPolicies.isNotEmpty()
+            cpufreqPolicies.isNotEmpty() || energyModelDomains.isNotEmpty() || socInfo != null
 }
 
 /** Parser for the `PROBE_BEGIN` ... `PROBE_END` section emitted by `voltset.sh status`. */
@@ -58,6 +60,8 @@ object SystemProbeParser {
             scmiDrivers = splitCsv(kv["scmi_drivers"]),
             scmiDeviceCount = kv["scmi_device_count"]?.toIntOrNull()?.coerceAtLeast(0) ?: 0,
             cpufreqPolicies = splitCsv(kv["cpufreq_policies"]),
+            energyModelDomains = splitCsv(kv["energy_model_domains"]),
+            socInfo = cleanScalar(kv["socinfo"]),
         )
     }
 

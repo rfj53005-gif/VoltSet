@@ -128,7 +128,7 @@ scmi_module_asset() {
     printf '%s\n' "$asset"
 }
 
-read_scmi_to_file() {
+read_scmi_module_to_file() {
     local out_file=$1 check_file=${2:-} asset driver snap
     [ -d /sys/bus/scmi_protocol ] || {
         printf '缺少 /sys/bus/scmi_protocol 接口\n' >&2
@@ -183,6 +183,113 @@ read_scmi_to_file() {
     return 0
 }
 
+find_energy_model_dir() {
+    local hint_dbg=${1:-} mp
+    if [ -n "$hint_dbg" ] && [ -d "$hint_dbg/energy_model" ]; then
+        printf '%s\n' "$hint_dbg/energy_model"
+        return 0
+    fi
+    if [ -d /sys/kernel/debug/energy_model ]; then
+        printf '%s\n' /sys/kernel/debug/energy_model
+        return 0
+    fi
+    awk '$3 == "debugfs" { print $2 }' /proc/mounts 2>/dev/null > "$work/debugfs_mounts" || : > "$work/debugfs_mounts"
+    while read -r mp; do
+        [ -n "$mp" ] || continue
+        if [ -d "$mp/energy_model" ]; then
+            printf '%s\n' "$mp/energy_model"
+            return 0
+        fi
+    done < "$work/debugfs_mounts"
+    return 1
+}
+
+read_energy_model_snapshot() {
+    local em_dir=$1 out_file=$2
+    local dom=0 cpu cdir flags count max_pwr d
+
+    : > "$out_file"
+    {
+        printf '# source=debugfs_energy_model\n'
+        printf 'domain,query_index,perf_value,estimated_power_uW,latency_us,indicative_freq_kHz,level_index\n'
+    } > "$out_file"
+
+    for cpu in $(for d in "$em_dir"/cpu[0-9]*; do [ -d "$d" ] && basename "$d" || true; done | awk '{ sub(/^cpu/, ""); print }' | sort -n); do
+        cdir="$em_dir/cpu$cpu"
+        flags=
+        if [ -r "$cdir/flags" ]; then
+            flags=$(awk 'NF { print $1; exit }' "$cdir/flags" 2>/dev/null || true)
+        fi
+        if [ -n "$flags" ]; then
+            case "$flags" in
+                0[xX][0-9a-fA-F]*|[0-9]*)
+                    if [ $(( flags & 1 )) -eq 0 ] || [ $(( flags & 4 )) -ne 0 ]; then
+                        continue
+                    fi
+                    ;;
+            esac
+        fi
+
+        set -- "$cdir"/ps:*/frequency
+        [ -e "$1" ] || continue
+        awk '
+            {
+                p = FILENAME
+                sub(/^.*\//, "", p)
+                dir = FILENAME
+                sub(/\/[^\/]+$/, "", dir)
+                if (p == "frequency") freq[dir] = $1
+                else if (p == "power") pwr[dir] = $1
+            }
+            END {
+                for (d in freq) {
+                    if (freq[d] + 0 > 0 && pwr[d] + 0 > 0) {
+                        printf "%d %d\n", freq[d], pwr[d]
+                    }
+                }
+            }
+        ' "$cdir"/ps:*/frequency "$cdir"/ps:*/power 2>/dev/null | sort -n -k1,1 > "$work/em_sorted" || : > "$work/em_sorted"
+
+        count=$(awk 'END { print NR }' "$work/em_sorted" 2>/dev/null || echo 0)
+        [ "$count" -ge 2 ] || continue
+        if [ -z "$flags" ]; then
+            max_pwr=$(awk '$2 > m { m = $2 } END { printf "%d\n", m + 0 }' "$work/em_sorted")
+            [ "$max_pwr" -gt 50000 ] || continue
+        fi
+        awk -v dom="$dom" '{ i = NR - 1; printf "%d,%d,%s,%s,0,%s,%d\n", dom, i, $1, $2, $1, i }' "$work/em_sorted" >> "$out_file"
+        dom=$((dom + 1))
+    done
+
+    grep -q '^0,' "$out_file" && grep -q '^1,' "$out_file"
+}
+
+scmi_source=none
+
+read_scmi_to_file() {
+    local out_file=$1 check_file=${2:-} hint_dbg=${3:-}
+    local em_dir= mod_err=
+    scmi_source=none
+    em_dir=$(find_energy_model_dir "$hint_dbg" 2>/dev/null || true)
+    if [ -n "$em_dir" ] && read_energy_model_snapshot "$em_dir" "$out_file"; then
+        if [ -n "$check_file" ] && is_sm8850; then
+            read_energy_model_snapshot "$em_dir" "$check_file" 2>/dev/null || rm -f -- "$check_file"
+        fi
+        scmi_source=energy_model
+        return 0
+    fi
+    if read_scmi_module_to_file "$out_file" "$check_file" 2> "$work/scmi_mod.err"; then
+        scmi_source=module
+        return 0
+    fi
+    mod_err=$(tr '\n' ' ' < "$work/scmi_mod.err" 2>/dev/null | tr -s ' ' || true)
+    if [ -n "$em_dir" ]; then
+        printf 'debugfs/energy_model 未找到有效的微瓦双簇功耗表，且回退内核模块失败：%s\n' "${mod_err:-未知错误}" >&2
+    else
+        printf '未挂载或缺少 debugfs/energy_model，且回退内核模块失败：%s\n' "${mod_err:-未知错误}" >&2
+    fi
+    return 1
+}
+
 first_debugfs_mount() {
     local mp
     mp=$(awk '$3 == "debugfs" { print $2; exit }' /proc/mounts 2>/dev/null || true)
@@ -190,7 +297,7 @@ first_debugfs_mount() {
         printf '%s\n' "$mp"
         return 0
     fi
-    if [ -d /sys/kernel/debug/regmap ] || [ -d /sys/kernel/debug/qcom_voltage_adj ]; then
+    if [ -d /sys/kernel/debug/regmap ] || [ -d /sys/kernel/debug/qcom_voltage_adj ] || [ -d /sys/kernel/debug/energy_model ]; then
         printf '%s\n' /sys/kernel/debug
         return 0
     fi
@@ -433,6 +540,7 @@ join_lines_csv() {
 emit_system_probe() {
     local hint_dbg=${1:-} mod_loaded=${2:-0} mod_files=${3:-}
     local debugfs_mounts debugfs_volt_nodes pdp_cdt_partitions by_name_dirs scmi_drivers scmi_count cpufreq_policies
+    local energy_model_domains em_dir socinfo_dir socinfo_str pair f k v cpu cdir cnt
     local d p n c mn mx
 
     debugfs_mounts=$(awk '$3 == "debugfs" { print $2 }' /proc/mounts 2>/dev/null | join_lines_csv)
@@ -474,6 +582,43 @@ emit_system_probe() {
             printf '%s(%s,%d-%dMHz)\n' "$n" "${c:-?}" "$((mn / 1000))" "$((mx / 1000))"
         done | join_lines_csv
     )
+    em_dir=$(find_energy_model_dir "$hint_dbg" 2>/dev/null || true)
+    if [ -n "$em_dir" ]; then
+        energy_model_domains=$(
+            for cpu in $(for d in "$em_dir"/cpu[0-9]*; do [ -d "$d" ] && basename "$d" || true; done | awk '{ sub(/^cpu/, ""); print }' | sort -n); do
+                cdir="$em_dir/cpu$cpu"
+                c=$(awk '{ if (NF > 1) printf "%s-%s", $1, $NF; else if (NF == 1) printf "%s", $1 }' "$cdir/cpus" 2>/dev/null || true)
+                set -- "$cdir"/ps:*
+                if [ -d "$1" ]; then cnt=$#; else cnt=0; fi
+                printf 'cpu%s(%s,%d)\n' "$cpu" "${c:-?}" "$cnt"
+            done | join_lines_csv
+        )
+    else
+        energy_model_domains=none
+    fi
+    if [ -n "$hint_dbg" ] && [ -d "$hint_dbg/qcom_socinfo" ]; then
+        socinfo_dir="$hint_dbg/qcom_socinfo"
+    elif [ -d /sys/kernel/debug/qcom_socinfo ]; then
+        socinfo_dir=/sys/kernel/debug/qcom_socinfo
+    else
+        socinfo_dir=
+    fi
+    if [ -n "$socinfo_dir" ]; then
+        socinfo_str=
+        for pair in "chip_id:chip" "foundry_id:foundry" "feature_code:feature" "pcode:pcode" "oem_variant:oem" "pmic_die_rev:pmic_rev"; do
+            f=${pair%%:*}
+            k=${pair#*:}
+            if [ -r "$socinfo_dir/$f" ]; then
+                v=$(awk 'NF { gsub(/^[ \t]+|[ \t]+$/, ""); print; exit }' "$socinfo_dir/$f" 2>/dev/null || true)
+                if [ -n "$v" ]; then
+                    socinfo_str="${socinfo_str:+$socinfo_str }$k=$v"
+                fi
+            fi
+        done
+        socinfo_str=${socinfo_str:-none}
+    else
+        socinfo_str=none
+    fi
 
     printf 'PROBE_BEGIN\n'
     printf 'vadj_platform_dev=%s\n' "${vadj_platform_dev:-none}"
@@ -489,6 +634,8 @@ emit_system_probe() {
     printf 'scmi_drivers=%s\n' "$scmi_drivers"
     printf 'scmi_device_count=%s\n' "$scmi_count"
     printf 'cpufreq_policies=%s\n' "$cpufreq_policies"
+    printf 'energy_model_domains=%s\n' "$energy_model_domains"
+    printf 'socinfo=%s\n' "$socinfo_str"
     printf 'PROBE_END\n'
 }
 
@@ -648,8 +795,9 @@ case "$action" in
             printf 'CDT_PATH=none\n'
         fi
 
-        if read_scmi_to_file "$work/scmi.csv" "$work/scmi-recheck.csv" 2> "$work/scmi.err"; then
+        if read_scmi_to_file "$work/scmi.csv" "$work/scmi-recheck.csv" "$dbg" 2> "$work/scmi.err"; then
             printf 'SCMI_STATUS=ok\n'
+            printf 'SCMI_SOURCE=%s\n' "$scmi_source"
             printf 'SCMI_BEGIN\n'
             awk '1' "$work/scmi.csv"
             printf 'SCMI_END\n'
@@ -660,6 +808,7 @@ case "$action" in
             fi
         else
             printf 'SCMI_STATUS=error\n'
+            printf 'SCMI_SOURCE=none\n'
             printf 'SCMI_ERROR=%s\n' "$(tr '\n' ' ' < "$work/scmi.err" | tr -s ' ')"
         fi
 
@@ -723,7 +872,8 @@ case "$action" in
         [ "$boot_idx" = 1 ] && { [ -z "$prev_idx" ] || [ "$prev_idx" = 1 ]; } ||
             die "无法确认本次开机为 Set 1，不能保存为原厂基线"
 
-        read_scmi_to_file "$work/scmi.csv" 2> "$work/scmi.err" || die "$(cat "$work/scmi.err")"
+        em_dbg=$(first_debugfs_mount 2>/dev/null || true)
+        read_scmi_to_file "$work/scmi.csv" "" "$em_dbg" 2> "$work/scmi.err" || die "$(cat "$work/scmi.err")"
         grep -q '^0,' "$work/scmi.csv" && grep -q '^1,' "$work/scmi.csv" ||
             die "SCMI 快照缺少 CPU 电压表数据"
 

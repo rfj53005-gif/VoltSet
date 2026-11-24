@@ -77,6 +77,8 @@ class CompatibilityCheckerTest {
             scmi_drivers=qcom-scmi-driver,scmi-perf-domain
             scmi_device_count=9
             cpufreq_policies=policy0(0-5,384-3628MHz),policy6(6-7,768-4608MHz)
+            energy_model_domains=cpu0(0-5,28),cpu6(6-7,29)
+            socinfo=chip=SM8850 foundry=1 feature=3 pcode=2 oem=0 pmic_rev=2.0
         """.trimIndent()
 
         val probe = SystemProbeParser.parse(
@@ -94,10 +96,13 @@ class CompatibilityCheckerTest {
         assertEquals(listOf("cdt=/dev/block/sdd2", "pdp_a=/dev/block/sde36", "pdp_cdb_a=/dev/block/sde37"), probe.pdpCdtPartitions)
         assertEquals(9, probe.scmiDeviceCount)
         assertEquals(listOf("policy0(0-5,384-3628MHz)", "policy6(6-7,768-4608MHz)"), probe.cpufreqPolicies)
+        assertEquals(listOf("cpu0(0-5,28)", "cpu6(6-7,29)"), probe.energyModelDomains)
+        assertEquals("chip=SM8850 foundry=1 feature=3 pcode=2 oem=0 pmic_rev=2.0", probe.socInfo)
 
         val input = sampleInput(
             debugfsPath = "/sys/kernel/debug",
             debugfsPrivateNs = false,
+            scmiSource = ScmiDataSource.ENERGY_MODEL,
             adjDirPath = "/sys/kernel/debug/custom_vadj",
             regmapNode = "1-00",
         )
@@ -108,11 +113,30 @@ class CompatibilityCheckerTest {
         assertTrue(regItem.detail.contains("1-00"))
 
         val snapshot = sampleSnapshot(input, report, systemProbe = probe)
-        val text = CompatibilityChecker.formatTextReport(snapshot, "0.3.5")
+        val text = CompatibilityChecker.formatTextReport(snapshot, "0.3.6")
         assertTrue(text.contains("[全机只读自动探测]"))
         assertTrue(text.contains("/vendor_dlkm/lib/modules/qcom_voltage_adj.ko"))
         assertTrue(text.contains("pdp_cdb_a=/dev/block/sde37"))
         assertTrue(text.contains("policy0(0-5,384-3628MHz)"))
+        assertTrue(text.contains("cpu0(0-5,28), cpu6(6-7,29)"))
+        assertTrue(text.contains("chip=SM8850 foundry=1 feature=3 pcode=2 oem=0 pmic_rev=2.0"))
+        assertTrue(text.contains("debugfs/energy_model (零内核模块)"))
+    }
+
+    @Test
+    fun energyModelScmiSourcePassesWithoutModuleEvenOn16kKernel() {
+        val input = sampleInput(
+            pageSizeBytes = 16384,
+            scmiModuleAsset = null,
+            scmiSource = ScmiDataSource.ENERGY_MODEL,
+        )
+        val report = CompatibilityChecker.evaluate(input)
+        val scmiItem = report.items.first { it.id == "scmi" }
+
+        assertEquals(CompatibilityLevel.COMPATIBLE, report.level)
+        assertEquals(CheckStatus.PASS, scmiItem.status)
+        assertTrue(scmiItem.summary.contains("energy_model 零模块"))
+        assertTrue(scmiItem.detail.contains("16K 页"))
     }
 
     @Test
@@ -143,17 +167,20 @@ class CompatibilityCheckerTest {
     }
 
     private fun sampleInput(
+        pageSizeBytes: Int? = 4096,
         debugfsPath: String? = "/sys/kernel/debug",
         debugfsPrivateNs: Boolean = false,
         pdpFwPath: String? = "/dev/block/by-name/pdp_a",
         pdpHardwareLimits: PdpHardwareLimits? = sampleHardwareLimits(),
         pdpFwError: String? = null,
+        scmiModuleAsset: String? = "modules/sm8850/android16-6-4k/qcom-scmi-ro.ko",
+        scmiSource: ScmiDataSource = ScmiDataSource.KERNEL_MODULE,
         adjDirPath: String? = null,
         regmapNode: String? = null,
     ): CompatibilityInput = CompatibilityInput(
         socModel = "SM8850",
         isSm8850 = true,
-        pageSizeBytes = 4096,
+        pageSizeBytes = pageSizeBytes,
         debugfsPath = debugfsPath,
         debugfsPrivateNs = debugfsPrivateNs,
         adjAvailable = true,
@@ -175,7 +202,8 @@ class CompatibilityCheckerTest {
             keyPairs = emptyList(),
             detail = "CDT 分区全零（原厂默认，Key 7 未开启）",
         ),
-        scmiModuleAsset = "modules/sm8850/android16-6-4k/qcom-scmi-ro.ko",
+        scmiModuleAsset = scmiModuleAsset,
+        scmiSource = scmiSource,
         scmiError = null,
         scmiPoints = listOf(
             ScmiPoint(domain = 0, levelIndex = 0, freqKhz = 384_000L, powerUw = 9_145L, voltageMv = 488, exactFormulaMatch = true),
@@ -250,6 +278,7 @@ class CompatibilityCheckerTest {
         cdtPath = "/dev/block/by-name/cdt",
         cdtStatus = input.cdtStatus,
         scmiModuleAsset = input.scmiModuleAsset,
+        scmiSource = input.scmiSource,
         scmiError = input.scmiError,
         scmiPoints = input.scmiPoints,
         qualityReport = null,

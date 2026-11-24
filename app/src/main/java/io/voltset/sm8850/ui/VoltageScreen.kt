@@ -50,6 +50,7 @@ import io.voltset.sm8850.VoltSetUiState
 import io.voltset.sm8850.core.BaselineSource
 import io.voltset.sm8850.core.ClusterVoltageStats
 import io.voltset.sm8850.core.DeviceSnapshot
+import io.voltset.sm8850.core.ScmiDataSource
 import io.voltset.sm8850.core.ScmiPlanParser
 import io.voltset.sm8850.core.VoltageDiffRow
 
@@ -148,6 +149,11 @@ private fun QualityCard(
 ) {
     val context = LocalContext.current
     val report = snapshot.qualityReport
+    val sourceLabel = when (snapshot.scmiSource) {
+        ScmiDataSource.ENERGY_MODEL -> "debugfs/energy_model 零模块"
+        ScmiDataSource.KERNEL_MODULE -> "qcom-scmi-ro.ko"
+        ScmiDataSource.NONE -> "SCMI"
+    }
     Surface(
         shape = RoundedCornerShape(18.dp),
         color = MaterialTheme.colorScheme.primaryContainer,
@@ -167,6 +173,7 @@ private fun QualityCard(
                         val text = buildString {
                             appendLine("VoltSet 体质电压表 · ${snapshot.deviceModel}")
                             appendLine("SCMI 计划电压 · 综合参考分 ${report.score}")
+                            appendLine("读表来源：$sourceLabel")
                             snapshot.bootCpussIndex?.let { appendLine("开机档位 Set $it（${if (snapshot.bootSet.firmwareIndex == null) "推定" else "固件锁定"}）") }
                             for (cluster in report.clusters) {
                                 appendLine()
@@ -215,7 +222,7 @@ private fun QualityCard(
                     }
                 }
                 Text(
-                    "两次读取一致 · ${report.points.size} 个频点。分数随计划电压变化，仅供参考。",
+                    "两次读取一致 · ${report.points.size} 个频点 · $sourceLabel。分数随计划电压变化，仅供参考。",
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
@@ -259,11 +266,16 @@ private fun ScmiSummaryCard(
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                     )
+                    val sourceSuffix = when (snapshot.scmiSource) {
+                        ScmiDataSource.ENERGY_MODEL -> " · energy_model 零模块"
+                        ScmiDataSource.KERNEL_MODULE -> " · 内核模块"
+                        ScmiDataSource.NONE -> ""
+                    }
                     Text(
                         text = when {
-                            snapshot.bootSet.firmwareIndex != null -> "固件锁定 Set ${snapshot.bootSet.firmwareIndex}"
-                            snapshot.bootCpussIndex != null -> "本次开机推定 Set ${snapshot.bootCpussIndex}"
-                            else -> "本次开机档待确认"
+                            snapshot.bootSet.firmwareIndex != null -> "固件锁定 Set ${snapshot.bootSet.firmwareIndex}$sourceSuffix"
+                            snapshot.bootCpussIndex != null -> "本次开机推定 Set ${snapshot.bootCpussIndex}$sourceSuffix"
+                            else -> "本次开机档待确认$sourceSuffix"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,

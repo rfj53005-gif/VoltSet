@@ -28,8 +28,8 @@
   - **跨机型路径只读自动兜底与全机探测**：当标准路径缺失时自动回退搜索 `/dev/block/platform/*/by-name` 与 `/sys/class/block/*/uevent`（`PARTNAME`）、`debugfs` 浅层调压节点、`/vendor_dlkm` / `/system_dlkm` / `/vendor` 模块目录，以及 `qcom,vadj` 平台设备对应的 SPMI `regmap` 节点；在「设备检测」页提供可折叠的**全机只读自动探测**清单，并支持一键复制完整文本诊断报告。
 - **只读 CDT Key 7 (SLT+ACD) 叠加风险预警**
   - 自动只读检查 `/dev/block/by-name/cdt`（兼容全零空分区、OEM 精简 9 字节 v6 及完整 v3–v6）；若发现同时开启了 CDT Key 7，将在首页和写入确认弹窗中发出显著警告，避免双重降压导致无法开机。
-- **即读即卸的 SCMI 实时电压对比**
-  - 每次刷新仅在操作锁保护下临时加载 `qcom-scmi-ro.ko` 读取最新 SCMI 电压计划并在退出前立即 `rmmod`。
+- **零内核模块优先 + `.ko` 自动兜底的 SCMI 实时电压对比**
+  - **优先直读 `debugfs/energy_model`**：Linux 内核 Energy Model 直接缓存了与 SCMI `DESCRIBE_LEVELS` 逐微瓦一致的 `frequency` / `power (µW)` 表，无需加载任何内核模块（零 `insmod`），原生兼容 **16K 页内核**及任意内核版本；若目标内核未开启 `energy_model`，自动回退至按操作锁临时加载、退出即 `rmmod` 的 `qcom-scmi-ro.ko`。
   - SM8850 在「SCMI 电压」页提供体质电压表。两次读取一致且整数电压换算通过后显示双簇参考分、综合分和可复制的频点表。评分规则参考 [jkHXQ 的 RMX5010-CPU-Voltage](https://github.com/jkHXQ/RMX5010-CPU-Voltage#输出与评分)，分数随当前电压计划变化。
   - 在确认处于原厂 Set 1（且 CDT Key 7 关闭）时自动记录原厂基线至 `/data/adb/voltset/persistent/stock-baseline.csv`，若本机已有 SunTuner 采集过的基线也可直接只读复用。
 
@@ -134,7 +134,7 @@ $$\text{power\_uW} = \left\lfloor \frac{\text{coeff} \times \text{freq\_kHz} \ti
 
 可直接安装 APK 并授予 Root 后打开查看（**不点击任何「应用」按钮时全程纯只读**），在底部「**设备检测**」标签页查看自动判定结果：
 1. **阻塞性必要条件**：内核暴露了可读写的 `debugfs/qcom_voltage_adj/{get_overrides,set_overrides}`、设备存在包含非零降压条目的 `pdp_cdb` 分区，且 `OEM_VOLTAGE_ADJUSTMENTS_SET_OVERRIDE == 0`。
-2. **可选观测条件**：若目标机内核为 **16K 页**或非内置 4K GKI 世代（Android 16 gen5/gen6），`qcom-scmi-ro.ko` 无法加载时会跳过实时电压对比，但**不影响读取 `pdp_cdb` 与切换 Set**。
+2. **可选观测条件**：首选 `debugfs/energy_model` 零模块读取电压表，因此即使在 **16K 页**或非 4K GKI 内核上只要内核开启了 Energy Model 即可正常显示实测电压与本机实降范围；仅当同时缺少 `energy_model` 且无法加载 4K `qcom-scmi-ro.ko` 时才会跳过实时电压对比，也**不影响读取 `pdp_cdb` 与切换 Set**。
 3. **跨机型试水建议**：首次测试未知机型请从温和档位（`-4 ~ -12 mV`）开始，重启后核对 SDAM 索引未被引导程序重置、再结合稳定性负载测试逐步下探。
 
 > [!WARNING]

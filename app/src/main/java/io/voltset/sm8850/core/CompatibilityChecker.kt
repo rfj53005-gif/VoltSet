@@ -55,6 +55,7 @@ data class CompatibilityInput(
     val pdpFwError: String?,
     val cdtStatus: CdtStatus,
     val scmiModuleAsset: String?,
+    val scmiSource: ScmiDataSource = ScmiDataSource.NONE,
     val scmiError: String?,
     val scmiPoints: List<ScmiPoint>,
     val adjDirPath: String? = null,
@@ -288,15 +289,23 @@ object CompatibilityChecker {
         // 7. SCMI live table capability (optional, non-blocking)
         val pageLabel = input.pageSizeBytes?.let { "${it / 1024}K 页" } ?: "未知页大小"
         items += when {
-            input.scmiError == null && input.scmiPoints.isNotEmpty() && input.scmiPoints.all { it.exactFormulaMatch } ->
+            input.scmiError == null && input.scmiPoints.isNotEmpty() && input.scmiPoints.all { it.exactFormulaMatch } -> {
+                val (summary, detail) = if (input.scmiSource == ScmiDataSource.ENERGY_MODEL) {
+                    "正常 · ${input.scmiPoints.size} 个频点（energy_model 零模块，公式 100% 吻合）" to
+                        "已直接从内核 debugfs/energy_model 读取 SCMI 功率表（无需加载 .ko 模块，原生兼容 $pageLabel 与任意内核版本），可用 Set 1 原厂基线精确检验实际 mV 变化。"
+                } else {
+                    "正常 · ${input.scmiPoints.size} 个频点（$pageLabel，公式 100% 吻合）" to
+                        "内置模块 ${input.scmiModuleAsset ?: "qcom-scmi-ro.ko"} 工作正常，可用 Set 1 原厂基线精确检验实际 mV 变化。"
+                }
                 CompatibilityCheckItem(
                     id = "scmi",
                     title = "SCMI 实时电压读表（可选）",
                     status = CheckStatus.PASS,
-                    summary = "正常 · ${input.scmiPoints.size} 个频点（$pageLabel，公式 100% 吻合）",
-                    detail = "内置模块 ${input.scmiModuleAsset ?: "qcom-scmi-ro.ko"} 工作正常，可用 Set 1 原厂基线精确检验实际 mV 变化。",
+                    summary = summary,
+                    detail = detail,
                     blocking = false,
                 )
+            }
             input.scmiError == null && input.scmiPoints.isNotEmpty() -> {
                 val exactCount = input.scmiPoints.count { it.exactFormulaMatch }
                 CompatibilityCheckItem(
@@ -304,7 +313,7 @@ object CompatibilityChecker {
                     title = "SCMI 实时电压读表（可选）",
                     status = CheckStatus.WARN,
                     summary = "已读取 ${input.scmiPoints.size} 个频点（$exactCount/${input.scmiPoints.size} 公式吻合）",
-                    detail = "电压表可读，但当前平台的功率系数可能与 SM8850 不同，部分反推 mV 数值仅供参考，不影响调压功能本身。",
+                    detail = "电压表可读（来源：${if (input.scmiSource == ScmiDataSource.ENERGY_MODEL) "debugfs/energy_model" else input.scmiModuleAsset ?: "SCMI 模块"}），但当前平台的功率系数可能与 SM8850 不同，部分反推 mV 数值仅供参考，不影响调压功能本身。",
                     blocking = false,
                 )
             }
@@ -318,8 +327,8 @@ object CompatibilityChecker {
                     id = "scmi",
                     title = "SCMI 实时电压读表（可选）",
                     status = CheckStatus.WARN,
-                    summary = "无法加载读表模块（不影响调压）",
-                    detail = "${pageHint}模块 ${input.scmiModuleAsset ?: "无"}，原因：${input.scmiError ?: "无快照数据"}。这仅影响「SCMI 电压」实测对比，不影响切换 Set 档位。",
+                    summary = "无法读取 SCMI 电压表（不影响调压）",
+                    detail = "${pageHint}未找到可用的 debugfs/energy_model，且回退模块 ${input.scmiModuleAsset ?: "无"} 不可用，原因：${input.scmiError ?: "无快照数据"}。这仅影响「SCMI 电压」实测对比，不影响切换 Set 档位。",
                     blocking = false,
                 )
             }
@@ -421,6 +430,7 @@ object CompatibilityChecker {
             pdpFwError = snapshot.pdpFwError,
             cdtStatus = snapshot.cdtStatus,
             scmiModuleAsset = snapshot.scmiModuleAsset,
+            scmiSource = snapshot.scmiSource,
             scmiError = snapshot.scmiError,
             scmiPoints = snapshot.scmiPoints,
             adjDirPath = snapshot.systemProbe.adjDirPath,
@@ -471,6 +481,14 @@ object CompatibilityChecker {
             appendLine("by-name 目录: ${probe.byNameDirs.joinToString(", ").ifEmpty { "none" }}")
             appendLine("SCMI 接口: ${probe.scmiDeviceCount} 个设备 | ${probe.scmiDrivers.joinToString(", ").ifEmpty { "none" }}")
             appendLine("CPU 调频簇: ${probe.cpufreqPolicies.joinToString(", ").ifEmpty { "none" }}")
+            val scmiSourceStr = when (snapshot.scmiSource) {
+                ScmiDataSource.ENERGY_MODEL -> "debugfs/energy_model (零内核模块)"
+                ScmiDataSource.KERNEL_MODULE -> "qcom-scmi-ro.ko"
+                ScmiDataSource.NONE -> "none"
+            }
+            appendLine("电压表来源: $scmiSourceStr")
+            appendLine("energy_model 域: ${probe.energyModelDomains.joinToString(", ").ifEmpty { "none" }}")
+            appendLine("硅片信息 (socinfo): ${probe.socInfo ?: "none"}")
         }
         val sets = snapshot.pdpCdb?.sets.orEmpty()
         if (sets.isNotEmpty()) {

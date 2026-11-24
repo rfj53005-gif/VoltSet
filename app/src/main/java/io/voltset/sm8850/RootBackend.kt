@@ -13,6 +13,7 @@ import io.voltset.sm8850.core.PdpCdbData
 import io.voltset.sm8850.core.PdpCdbParser
 import io.voltset.sm8850.core.PdpFirmwareParser
 import io.voltset.sm8850.core.PdpHardwareLimits
+import io.voltset.sm8850.core.ScmiDataSource
 import io.voltset.sm8850.core.ScmiPlanParser
 import io.voltset.sm8850.core.ScmiQualityReport
 import io.voltset.sm8850.core.SystemProbeParser
@@ -212,6 +213,11 @@ internal class RootBackend(private val context: Context) {
             ScmiQualityReport.evaluate(initialPoints, ScmiPlanParser.parseCsv(csv, isSm8850))
         }
         val scmiPoints = qualityReport?.points ?: initialPoints
+        val scmiSource = when (kv["SCMI_SOURCE"]) {
+            "energy_model" -> ScmiDataSource.ENERGY_MODEL
+            "module" -> ScmiDataSource.KERNEL_MODULE
+            else -> ScmiDataSource.NONE
+        }
         val scmiError = when {
             kv["SCMI_STATUS"] != "ok" -> kv["SCMI_ERROR"]?.takeIf { it.isNotBlank() } ?: "读取 SCMI 失败"
             scmiPoints.isEmpty() -> "SCMI 快照没有可解析的 CPU 频点"
@@ -288,6 +294,7 @@ internal class RootBackend(private val context: Context) {
                 pdpFwError = pdpFwError,
                 cdtStatus = cdtStatus,
                 scmiModuleAsset = scmiModuleAsset,
+                scmiSource = scmiSource,
                 scmiError = scmiError,
                 scmiPoints = scmiPoints,
                 adjDirPath = adjDirPath,
@@ -322,6 +329,7 @@ internal class RootBackend(private val context: Context) {
             cdtPath = kv["CDT_PATH"]?.takeIf { it != "none" },
             cdtStatus = cdtStatus,
             scmiModuleAsset = scmiModuleAsset,
+            scmiSource = scmiSource,
             scmiError = scmiError,
             scmiPoints = scmiPoints,
             qualityReport = qualityReport,

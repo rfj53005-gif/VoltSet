@@ -7,6 +7,13 @@ enum class BaselineSource {
     SUNTUNER,
 }
 
+/** Where the CPU SCMI planned-voltage table was read from. */
+enum class ScmiDataSource {
+    NONE,
+    ENERGY_MODEL,
+    KERNEL_MODULE,
+}
+
 /** Immediate readback after writing `set_overrides`. */
 data class OverrideWriteResult(
     val sdamCpussIndex: Int,
@@ -42,6 +49,7 @@ data class DeviceSnapshot(
     val cdtPath: String?,
     val cdtStatus: CdtStatus,
     val scmiModuleAsset: String?,
+    val scmiSource: ScmiDataSource = ScmiDataSource.NONE,
     val scmiError: String?,
     val scmiPoints: List<ScmiPoint>,
     val qualityReport: ScmiQualityReport?,

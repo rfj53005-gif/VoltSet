@@ -476,6 +476,14 @@ private fun SystemProbeCard(snapshot: DeviceSnapshot) {
                         label = "CPU 调频簇",
                         value = probe.cpufreqPolicies.joinToString("\n").ifEmpty { "未读取" },
                     )
+                    ProbeInfoRow(
+                        label = "energy_model 零模块读表域",
+                        value = probe.energyModelDomains.joinToString("\n").ifEmpty { "未发现" },
+                    )
+                    ProbeInfoRow(
+                        label = "硅片信息 (qcom_socinfo)",
+                        value = probe.socInfo ?: "未读取",
+                    )
                     Text(
                         text = "提示：点击顶部「复制检测报告」可一并导出以上全部只读探测路径，便于排查跨机型适配问题。",
                         style = MaterialTheme.typography.labelSmall,
