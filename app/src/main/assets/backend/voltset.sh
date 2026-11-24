@@ -5,10 +5,14 @@ export PATH
 umask 077
 
 existing_debugfs_has_adj() {
-    local mp
+    local mp hit
     [ -e /sys/kernel/debug/qcom_voltage_adj/get_overrides ] && return 0
     for mp in $(awk '$3 == "debugfs" { print $2 }' /proc/mounts 2>/dev/null || true); do
         [ -e "$mp/qcom_voltage_adj/get_overrides" ] && return 0
+    done
+    for mp in $(awk '$3 == "debugfs" { print $2 }' /proc/mounts 2>/dev/null || true); do
+        hit=$(find "$mp" -maxdepth 2 -name get_overrides 2>/dev/null | head -n 1 || true)
+        [ -n "$hit" ] && return 0
     done
     return 1
 }
@@ -179,47 +183,147 @@ read_scmi_to_file() {
     return 0
 }
 
-find_debugfs() {
+first_debugfs_mount() {
     local mp
-    awk '$3 == "debugfs" { print $2 }' /proc/mounts 2>/dev/null > "$work/debugfs_mounts" || : > "$work/debugfs_mounts"
-    while read -r mp; do
-        [ -n "$mp" ] || continue
-        if [ -e "$mp/qcom_voltage_adj/get_overrides" ]; then
-            printf '%s\n' "$mp"
-            return 0
-        fi
-    done < "$work/debugfs_mounts"
-    if [ -e /sys/kernel/debug/qcom_voltage_adj/get_overrides ]; then
+    mp=$(awk '$3 == "debugfs" { print $2; exit }' /proc/mounts 2>/dev/null || true)
+    if [ -n "$mp" ]; then
+        printf '%s\n' "$mp"
+        return 0
+    fi
+    if [ -d /sys/kernel/debug/regmap ] || [ -d /sys/kernel/debug/qcom_voltage_adj ]; then
         printf '%s\n' /sys/kernel/debug
         return 0
     fi
     return 1
 }
 
-read_reg_7151() {
-    local hint_dbg=${1:-} candidate mp val
-    for candidate in "$hint_dbg/regmap/0-00/registers" /sys/kernel/debug/regmap/0-00/registers; do
-        if [ -n "$candidate" ] && [ -r "$candidate" ]; then
-            val=$(awk -F: '$1 == "7151" { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }' "$candidate" 2>/dev/null || true)
-            if [ -n "$val" ]; then
-                printf '%s\n' "$val"
-                return 0
-            fi
-        fi
-    done
+dbg=
+adj_dir=
+
+find_adj_pair() {
+    local mp hit
+    dbg=
+    adj_dir=
     awk '$3 == "debugfs" { print $2 }' /proc/mounts 2>/dev/null > "$work/debugfs_mounts" || : > "$work/debugfs_mounts"
     while read -r mp; do
         [ -n "$mp" ] || continue
-        candidate="$mp/regmap/0-00/registers"
+        if [ -e "$mp/qcom_voltage_adj/get_overrides" ]; then
+            dbg=$mp
+            adj_dir=$mp/qcom_voltage_adj
+            return 0
+        fi
+    done < "$work/debugfs_mounts"
+    if [ -e /sys/kernel/debug/qcom_voltage_adj/get_overrides ]; then
+        dbg=/sys/kernel/debug
+        adj_dir=/sys/kernel/debug/qcom_voltage_adj
+        return 0
+    fi
+    while read -r mp; do
+        [ -n "$mp" ] || continue
+        hit=$(find "$mp" -maxdepth 2 -name get_overrides 2>/dev/null | head -n 1 || true)
+        if [ -n "$hit" ]; then
+            dbg=$mp
+            adj_dir=$(dirname "$hit")
+            return 0
+        fi
+    done < "$work/debugfs_mounts"
+    if [ -d /sys/kernel/debug ]; then
+        hit=$(find /sys/kernel/debug -maxdepth 2 -name get_overrides 2>/dev/null | head -n 1 || true)
+        if [ -n "$hit" ]; then
+            dbg=/sys/kernel/debug
+            adj_dir=$(dirname "$hit")
+            return 0
+        fi
+    fi
+    return 1
+}
+
+vadj_platform_dev=
+vadj_driver=
+vadj_spmi_parent=
+vadj_dt_path=
+
+discover_vadj_platform() {
+    local cand= p hit real pdir
+    vadj_platform_dev=
+    vadj_driver=
+    vadj_spmi_parent=
+    vadj_dt_path=
+    for p in /sys/bus/platform/devices/*voltage*adj* /sys/bus/platform/devices/*vadj*; do
+        if [ -e "$p" ]; then
+            cand=$p
+            break
+        fi
+    done
+    if [ -z "$cand" ]; then
+        hit=$(grep -lE 'OF_COMPATIBLE_[0-9]+=qcom,(vadj|voltage-adj)|^DRIVER=qcom_voltage_adj$' /sys/bus/platform/devices/*/uevent 2>/dev/null | head -n 1 || true)
+        [ -n "$hit" ] && cand=${hit%/uevent}
+    fi
+    [ -n "$cand" ] || return 0
+    vadj_platform_dev=$(basename "$cand")
+    if [ -r "$cand/uevent" ]; then
+        vadj_driver=$(awk -F= '$1 == "DRIVER" { print $2; exit }' "$cand/uevent" 2>/dev/null || true)
+        vadj_dt_path=$(awk -F= '$1 == "OF_FULLNAME" { print $2; exit }' "$cand/uevent" 2>/dev/null || true)
+    fi
+    [ -n "$vadj_driver" ] || vadj_driver=unbound
+    real=$(readlink -f "$cand" 2>/dev/null || true)
+    if [ -n "$real" ]; then
+        pdir=$(basename "$(dirname "$real")" 2>/dev/null || true)
+        case "$pdir" in
+            [0-9]*-[0-9a-fA-F]*|spmi*) vadj_spmi_parent=$pdir ;;
+        esac
+    fi
+}
+
+reg_7151=unavailable
+regmap_node=none
+
+read_reg_7151() {
+    local hint_dbg=${1:-} spmi_hint=${2:-}
+    local candidates rn candidate mp val
+    reg_7151=unavailable
+    regmap_node=none
+    if [ -n "$spmi_hint" ] && [ "$spmi_hint" != "0-00" ]; then
+        candidates="$spmi_hint 0-00"
+    else
+        candidates="0-00"
+    fi
+    awk '$3 == "debugfs" { print $2 }' /proc/mounts 2>/dev/null > "$work/debugfs_mounts" || : > "$work/debugfs_mounts"
+    for rn in $candidates; do
+        if [ -n "$hint_dbg" ]; then
+            candidate="$hint_dbg/regmap/$rn/registers"
+            if [ -r "$candidate" ]; then
+                val=$(awk -F: '$1 == "7151" { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }' "$candidate" 2>/dev/null || true)
+                if [ -n "$val" ]; then
+                    reg_7151=$val
+                    regmap_node=$rn
+                    return 0
+                fi
+            fi
+        fi
+        candidate="/sys/kernel/debug/regmap/$rn/registers"
         if [ -r "$candidate" ]; then
             val=$(awk -F: '$1 == "7151" { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }' "$candidate" 2>/dev/null || true)
             if [ -n "$val" ]; then
-                printf '%s\n' "$val"
+                reg_7151=$val
+                regmap_node=$rn
                 return 0
             fi
         fi
-    done < "$work/debugfs_mounts"
-    printf '%s\n' unavailable
+        while read -r mp; do
+            [ -n "$mp" ] || continue
+            candidate="$mp/regmap/$rn/registers"
+            if [ -r "$candidate" ]; then
+                val=$(awk -F: '$1 == "7151" { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }' "$candidate" 2>/dev/null || true)
+                if [ -n "$val" ]; then
+                    reg_7151=$val
+                    regmap_node=$rn
+                    return 0
+                fi
+            fi
+        done < "$work/debugfs_mounts"
+    done
+    return 0
 }
 
 read_overrides_indices() {
@@ -239,13 +343,32 @@ verify_overrides() {
 }
 
 find_partition_dev() {
-    local path
-    for path in "/dev/block/by-name/$1" "/dev/block/bootdevice/by-name/$1"; do
+    local target=$1 path blk
+    for path in \
+        "/dev/block/by-name/$target" \
+        "/dev/block/bootdevice/by-name/$target" \
+        /dev/block/platform/*/by-name/"$target" \
+        /dev/block/platform/*/*/by-name/"$target"; do
         if [ -e "$path" ]; then
             printf '%s\n' "$path"
             return 0
         fi
     done
+    blk=$(awk -F= -v t="$target" '
+        FNR == 1 {
+            b = FILENAME
+            sub(/^\/sys\/class\/block\//, "", b)
+            sub(/\/uevent$/, "", b)
+        }
+        $1 == "PARTNAME" && $2 == t {
+            print b
+            exit
+        }
+    ' /sys/class/block/*/uevent 2>/dev/null || true)
+    if [ -n "$blk" ] && [ -b "/dev/block/$blk" ]; then
+        printf '/dev/block/%s\n' "$blk"
+        return 0
+    fi
     return 1
 }
 
@@ -295,7 +418,78 @@ emit_partition_block() {
 }
 
 find_cdt() {
+    local slot
+    slot=$(getprop ro.boot.slot_suffix 2>/dev/null || true)
+    if [ -n "$slot" ] && find_partition_dev "cdt$slot"; then
+        return 0
+    fi
     find_partition_dev cdt
+}
+
+join_lines_csv() {
+    awk 'NF { printf "%s%s", (c++ ? "," : ""), $0 } END { if (!c) printf "none"; printf "\n" }'
+}
+
+emit_system_probe() {
+    local hint_dbg=${1:-} mod_loaded=${2:-0} mod_files=${3:-}
+    local debugfs_mounts debugfs_volt_nodes pdp_cdt_partitions by_name_dirs scmi_drivers scmi_count cpufreq_policies
+    local d p n c mn mx
+
+    debugfs_mounts=$(awk '$3 == "debugfs" { print $2 }' /proc/mounts 2>/dev/null | join_lines_csv)
+    if [ -n "$hint_dbg" ] && [ -d "$hint_dbg" ]; then
+        debugfs_volt_nodes=$(find "$hint_dbg" -maxdepth 2 \( -iname '*voltage_adj*' -o -iname '*vadj*' -o -name 'get_overrides' -o -name 'set_overrides' -o -iname '*cpr*' \) 2>/dev/null | sort -u | head -n 12 | join_lines_csv)
+    else
+        debugfs_volt_nodes=none
+    fi
+    pdp_cdt_partitions=$(awk -F= '
+        FNR == 1 {
+            b = FILENAME
+            sub(/^\/sys\/class\/block\//, "", b)
+            sub(/\/uevent$/, "", b)
+        }
+        $1 == "PARTNAME" && tolower($2) ~ /^(pdp|cdt)/ {
+            printf "%s=/dev/block/%s\n", $2, b
+        }
+    ' /sys/class/block/*/uevent 2>/dev/null | sort | head -n 16 | join_lines_csv)
+    by_name_dirs=$(
+        for d in /dev/block/by-name /dev/block/bootdevice/by-name /dev/block/platform/*/by-name /dev/block/platform/*/*/by-name; do
+            [ -d "$d" ] && printf '%s\n' "$d" || true
+        done | sort -u | join_lines_csv
+    )
+    scmi_drivers=$(
+        for d in /sys/bus/scmi_protocol/drivers/*; do
+            [ -e "$d" ] && basename "$d" || true
+        done | sort | join_lines_csv
+    )
+    scmi_count=$(set -- /sys/bus/scmi_protocol/devices/*; [ -e "$1" ] && printf '%s\n' "$#" || printf '0\n')
+    cpufreq_policies=$(
+        for p in /sys/devices/system/cpu/cpufreq/policy*; do
+            [ -d "$p" ] || continue
+            n=$(basename "$p")
+            c=$(awk '{ if (NF > 1) printf "%s-%s", $1, $NF; else if (NF == 1) printf "%s", $1 }' "$p/affected_cpus" 2>/dev/null || true)
+            mn=$(cat "$p/cpuinfo_min_freq" 2>/dev/null || echo 0)
+            mx=$(cat "$p/cpuinfo_max_freq" 2>/dev/null || echo 0)
+            case "$mn" in ''|*[!0-9]*) mn=0 ;; esac
+            case "$mx" in ''|*[!0-9]*) mx=0 ;; esac
+            printf '%s(%s,%d-%dMHz)\n' "$n" "${c:-?}" "$((mn / 1000))" "$((mx / 1000))"
+        done | join_lines_csv
+    )
+
+    printf 'PROBE_BEGIN\n'
+    printf 'vadj_platform_dev=%s\n' "${vadj_platform_dev:-none}"
+    printf 'vadj_driver=%s\n' "${vadj_driver:-none}"
+    printf 'vadj_spmi_parent=%s\n' "${vadj_spmi_parent:-none}"
+    printf 'vadj_dt_path=%s\n' "${vadj_dt_path:-none}"
+    printf 'vadj_module_loaded=%s\n' "$mod_loaded"
+    printf 'vadj_module_files=%s\n' "${mod_files:-none}"
+    printf 'debugfs_mounts=%s\n' "$debugfs_mounts"
+    printf 'debugfs_volt_nodes=%s\n' "$debugfs_volt_nodes"
+    printf 'pdp_cdt_partitions=%s\n' "$pdp_cdt_partitions"
+    printf 'by_name_dirs=%s\n' "$by_name_dirs"
+    printf 'scmi_drivers=%s\n' "$scmi_drivers"
+    printf 'scmi_device_count=%s\n' "$scmi_count"
+    printf 'cpufreq_policies=%s\n' "$cpufreq_policies"
+    printf 'PROBE_END\n'
 }
 
 [ "$(id -u)" = 0 ] || die "需要 Root 权限"
@@ -360,20 +554,33 @@ case "$action" in
             printf 'STAGED_THIS_BOOT_IDX=%s\n' "$last_set_idx"
         fi
 
-        dbg=
-        if dbg=$(find_debugfs); then
+        discover_vadj_platform
+        vadj_mod_loaded=0
+        if grep -qE '(^|[[:space:]])qcom_voltage_adj([[:space:]]|$)' /proc/modules 2>/dev/null ||
+            [ -d /sys/module/qcom_voltage_adj ] ||
+            [ -d /sys/bus/platform/drivers/qcom_voltage_adj ]; then
+            vadj_mod_loaded=1
+        fi
+        vadj_mod_files=$(
+            for d in /vendor_dlkm/lib/modules /vendor/lib/modules /system_dlkm/lib/modules /lib/modules; do
+                [ -d "$d" ] && find "$d" -maxdepth 3 -iname '*voltage*adj*.ko*' 2>/dev/null || true
+            done | sort -u | head -n 8 | awk 'NF { printf "%s%s", (c++ ? "," : ""), $0 }'
+        )
+
+        if find_adj_pair; then
             printf 'DEBUGFS=%s\n' "$dbg"
+            printf 'ADJ_DIR=%s\n' "$adj_dir"
             if [ "${VOLTSET_PRIVATE_NS:-0}" = 1 ]; then
                 printf 'DEBUGFS_PRIVATE_NS=1\n'
             else
                 printf 'DEBUGFS_PRIVATE_NS=0\n'
             fi
-            if [ -e "$dbg/qcom_voltage_adj/set_overrides" ]; then
+            if [ -e "$adj_dir/set_overrides" ]; then
                 printf 'ADJ_SET_NODE=1\n'
             else
                 printf 'ADJ_SET_NODE=0\n'
             fi
-            if read_overrides_indices "$dbg/qcom_voltage_adj/get_overrides"; then
+            if read_overrides_indices "$adj_dir/get_overrides"; then
                 printf 'ADJ_AVAILABLE=1\n'
                 if [ ! -f "$session/boot-cpuss-idx" ]; then
                     printf '%s\n' "$cpuss_idx" > "$session/boot-cpuss-idx"
@@ -385,15 +592,24 @@ case "$action" in
                 printf 'ADJ_ERROR=无法解析 get_overrides 输出\n'
             fi
         else
-            printf 'DEBUGFS=none\n'
-            printf 'DEBUGFS_PRIVATE_NS=0\n'
+            dbg=$(first_debugfs_mount 2>/dev/null || true)
+            printf 'DEBUGFS=%s\n' "${dbg:-none}"
+            printf 'ADJ_DIR=none\n'
+            if [ "${VOLTSET_PRIVATE_NS:-0}" = 1 ]; then
+                printf 'DEBUGFS_PRIVATE_NS=1\n'
+            else
+                printf 'DEBUGFS_PRIVATE_NS=0\n'
+            fi
             printf 'ADJ_SET_NODE=0\n'
             printf 'ADJ_AVAILABLE=0\n'
-            if grep -qE '(^|[[:space:]])qcom_voltage_adj([[:space:]]|$)' /proc/modules 2>/dev/null ||
-                ls /vendor/lib/modules/*voltage_adj* >/dev/null 2>&1; then
-                printf 'ADJ_ERROR=已检测到 qcom_voltage_adj 模块，但无法挂载或访问 debugfs 节点（请检查内核 CONFIG_DEBUG_FS 或 SELinux 限制）\n'
+            if [ "$vadj_mod_loaded" = 1 ]; then
+                printf 'ADJ_ERROR=内核已加载 qcom_voltage_adj 驱动，但无法挂载或访问 debugfs 节点（请检查内核 CONFIG_DEBUG_FS 或 SELinux 限制）\n'
+            elif [ -n "$vadj_mod_files" ]; then
+                printf 'ADJ_ERROR=在系统目录发现模块（%s）但未加载到内核，且未找到 debugfs 节点\n' "$vadj_mod_files"
+            elif [ -n "$vadj_platform_dev" ]; then
+                printf 'ADJ_ERROR=设备树存在 %s 节点，但内核未内置或未加载 qcom_voltage_adj 驱动\n' "$vadj_platform_dev"
             else
-                printf 'ADJ_ERROR=未在 debugfs 找到 qcom_voltage_adj 接口（内核可能未内置或已裁剪该驱动）\n'
+                printf 'ADJ_ERROR=未在 debugfs、内核模块目录或设备树中发现 qcom_voltage_adj 接口（当前机型/内核可能未启用该功能）\n'
             fi
         fi
 
@@ -401,7 +617,8 @@ case "$action" in
             printf 'FIRST_SDAM_IDX=%s\n' "$(cat "$session/boot-cpuss-idx")"
         fi
 
-        reg_7151=$(read_reg_7151 "$dbg")
+        read_reg_7151 "$dbg" "$vadj_spmi_parent"
+        printf 'REGMAP_NODE=%s\n' "$regmap_node"
         printf 'REG_7151=%s\n' "$reg_7151"
 
         if pdp_dev=$(find_pdp_cdb); then
@@ -459,6 +676,8 @@ case "$action" in
         else
             printf 'BASELINE_SOURCE=none\n'
         fi
+
+        emit_system_probe "$dbg" "$vadj_mod_loaded" "$vadj_mod_files"
         ;;
 
     set_override)
@@ -470,25 +689,26 @@ case "$action" in
         case "$target_cpuss" in [1-7]) ;; *) die "CPUSS 档位必须为 1..7" ;; esac
         case "$target_global" in [0-7]) ;; *) die "Global 档位必须为 0..7" ;; esac
 
-        dbg=$(find_debugfs) || die "未找到 debugfs/qcom_voltage_adj 接口"
-        [ -e "$dbg/qcom_voltage_adj/set_overrides" ] || die "缺少 qcom_voltage_adj/set_overrides 节点"
-        [ -r "$dbg/qcom_voltage_adj/get_overrides" ] || die "缺少 qcom_voltage_adj/get_overrides 节点"
+        find_adj_pair || die "未找到 debugfs/qcom_voltage_adj 接口"
+        [ -e "$adj_dir/set_overrides" ] || die "缺少 qcom_voltage_adj/set_overrides 节点"
+        [ -r "$adj_dir/get_overrides" ] || die "缺少 qcom_voltage_adj/get_overrides 节点"
 
-        verify_overrides "$dbg/qcom_voltage_adj/get_overrides" "$expected_cpuss" "$target_global"
+        verify_overrides "$adj_dir/get_overrides" "$expected_cpuss" "$target_global"
         if [ ! -f "$session/boot-cpuss-idx" ]; then
             printf '%s\n' "$cpuss_idx" > "$session/boot-cpuss-idx"
         fi
         printf '%s %s\n' "$boot" "$target_cpuss" > "$work/last-set" || die "无法创建档位记录"
 
         dec=$(( (target_cpuss << 4) | target_global ))
-        printf '%s\n' "$dec" > "$dbg/qcom_voltage_adj/set_overrides" || die "写入 set_overrides 失败"
+        printf '%s\n' "$dec" > "$adj_dir/set_overrides" || die "写入 set_overrides 失败"
 
-        read_overrides_indices "$dbg/qcom_voltage_adj/get_overrides" || die "写入后回读 get_overrides 失败"
+        read_overrides_indices "$adj_dir/get_overrides" || die "写入后回读 get_overrides 失败"
         [ "$cpuss_idx" = "$target_cpuss" ] && [ "$global_idx" = "$target_global" ] ||
             die "写入校验失败：读回为 CPUSS=$cpuss_idx Global=$global_idx（期望 $target_cpuss/$target_global）"
         mv "$work/last-set" "$last_set" || die "SDAM 已写入，但无法保存重启核对记录"
 
-        reg_7151=$(read_reg_7151 "$dbg")
+        discover_vadj_platform
+        read_reg_7151 "$dbg" "$vadj_spmi_parent"
         printf 'SDAM_CPUSS_IDX=%s\n' "$cpuss_idx"
         printf 'SDAM_GLOBAL_IDX=%s\n' "$global_idx"
         printf 'REG_7151=%s\n' "$reg_7151"
@@ -529,8 +749,8 @@ case "$action" in
     reboot)
         [ "$#" = 3 ] || die "reboot 参数无效"
         [ "$1" = "$boot" ] || die "启动 ID 已改变，请刷新状态"
-        dbg=$(find_debugfs) || die "未找到 debugfs/qcom_voltage_adj 接口"
-        verify_overrides "$dbg/qcom_voltage_adj/get_overrides" "$2" "$3"
+        find_adj_pair || die "未找到 debugfs/qcom_voltage_adj 接口"
+        verify_overrides "$adj_dir/get_overrides" "$2" "$3"
         /system/bin/svc power reboot --no-wait
         ;;
 

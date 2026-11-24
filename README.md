@@ -23,8 +23,9 @@
   - 自动按当前 A/B 槽位读取设备自身的 `/dev/block/by-name/pdp_cdb[_a|_b]`，在 Kotlin 中完成 `ELF32 → CFDB v3 → sdbm 哈希` 解析，真实还原 `ALL` 全局基底与 `FREQ` / `PSTATE` 分频叠加值，并检测固件内是否存在强制锁死档位的 `OEM_VOLTAGE_ADJUSTMENTS_SET_OVERRIDE`。
   - **自动按体质匹配硬件限位**：同时只读读取活动槽位 `/dev/block/by-name/pdp[_a|_b]` 内的 `CFDB v3` DCVS 硬件限位表，不硬编码机型/bin 名称，通过结构体指纹与本机 SCMI 频点列表自动匹配各频点 `[floor, ceil]` 上下限。
   - **首页分机个体化范围显示**：结合本机 Set 1 原厂基线，按固件公式（`floor` 下限钳位 + `4 mV` 向上取整 + 单调递增约束）在切换前即为每个 Set 推算**本机预计实降范围**，并在生效后于首页直接展示**本机实测 SCMI 降幅**，区分「表定偏移」与「个体实降」。
-- **8 项只读设备兼容性检测**
-  - 针对不同机型与内核环境一键检查 SoC 平台、`qcom_voltage_adj` 读写节点、`0x7151` 寄存器回读、`pdp_cdb` 有效降压条目、固件覆盖锁、CDT Key 7 风险、SCMI 模块/内核页大小匹配度及 `pdp` 硬件限位表匹配状态，支持一键复制完整文本诊断报告。
+- **8 项只读设备兼容性检测与全机自动探测**
+  - 针对不同机型与内核环境一键检查 SoC 平台、`qcom_voltage_adj` 读写节点、`0x7151` 寄存器回读、`pdp_cdb` 有效降压条目、固件覆盖锁、CDT Key 7 风险、SCMI 模块/内核页大小匹配度及 `pdp` 硬件限位表匹配状态。
+  - **跨机型路径只读自动兜底与全机探测**：当标准路径缺失时自动回退搜索 `/dev/block/platform/*/by-name` 与 `/sys/class/block/*/uevent`（`PARTNAME`）、`debugfs` 浅层调压节点、`/vendor_dlkm` / `/system_dlkm` / `/vendor` 模块目录，以及 `qcom,vadj` 平台设备对应的 SPMI `regmap` 节点；在「设备检测」页提供可折叠的**全机只读自动探测**清单，并支持一键复制完整文本诊断报告。
 - **只读 CDT Key 7 (SLT+ACD) 叠加风险预警**
   - 自动只读检查 `/dev/block/by-name/cdt`（兼容全零空分区、OEM 精简 9 字节 v6 及完整 v3–v6）；若发现同时开启了 CDT Key 7，将在首页和写入确认弹窗中发出显著警告，避免双重降压导致无法开机。
 - **即读即卸的 SCMI 实时电压对比**

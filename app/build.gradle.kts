@@ -11,8 +11,8 @@ android {
         applicationId = "io.voltset.sm8850"
         minSdk = 30
         targetSdk = 36
-        versionCode = providers.gradleProperty("releaseVersionCode").orElse("7").get().toInt()
-        versionName = providers.gradleProperty("releaseVersionName").orElse("0.3.4").get()
+        versionCode = providers.gradleProperty("releaseVersionCode").orElse("8").get().toInt()
+        versionName = providers.gradleProperty("releaseVersionName").orElse("0.3.5").get()
     }
 
     buildTypes {

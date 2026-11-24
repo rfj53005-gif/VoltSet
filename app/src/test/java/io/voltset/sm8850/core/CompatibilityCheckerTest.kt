@@ -61,12 +61,95 @@ class CompatibilityCheckerTest {
         assertEquals(CompatibilityLevel.PARTIAL, missingReport.level)
     }
 
+    @Test
+    fun systemProbeParserAndReportFormattingWork() {
+        val probeBlock = """
+            vadj_platform_dev=c426000.spmi:pmk8850@0:qcom,voltage-adj-device
+            vadj_driver=qcom_voltage_adj
+            vadj_spmi_parent=1-00
+            vadj_dt_path=/soc/arbiter@c400000/spmi@c426000/pmk8850@0/qcom,voltage-adj-device
+            vadj_module_loaded=1
+            vadj_module_files=/vendor_dlkm/lib/modules/qcom_voltage_adj.ko
+            debugfs_mounts=/sys/kernel/debug
+            debugfs_volt_nodes=/sys/kernel/debug/custom_vadj,/sys/kernel/debug/custom_vadj/get_overrides
+            pdp_cdt_partitions=cdt=/dev/block/sdd2,pdp_a=/dev/block/sde36,pdp_cdb_a=/dev/block/sde37
+            by_name_dirs=/dev/block/by-name,/dev/block/platform/soc/1d84000.ufshc/by-name
+            scmi_drivers=qcom-scmi-driver,scmi-perf-domain
+            scmi_device_count=9
+            cpufreq_policies=policy0(0-5,384-3628MHz),policy6(6-7,768-4608MHz)
+        """.trimIndent()
+
+        val probe = SystemProbeParser.parse(
+            probeBlock = probeBlock,
+            adjDirPath = "/sys/kernel/debug/custom_vadj",
+            regmapNode = "1-00",
+        )
+        assertTrue(probe.hasAnyData)
+        assertEquals("/sys/kernel/debug/custom_vadj", probe.adjDirPath)
+        assertEquals("1-00", probe.regmapNode)
+        assertEquals("c426000.spmi:pmk8850@0:qcom,voltage-adj-device", probe.vadjPlatformDevice)
+        assertEquals("qcom_voltage_adj", probe.vadjDriver)
+        assertEquals("1-00", probe.vadjSpmiParent)
+        assertEquals(listOf("/vendor_dlkm/lib/modules/qcom_voltage_adj.ko"), probe.vadjModuleFiles)
+        assertEquals(listOf("cdt=/dev/block/sdd2", "pdp_a=/dev/block/sde36", "pdp_cdb_a=/dev/block/sde37"), probe.pdpCdtPartitions)
+        assertEquals(9, probe.scmiDeviceCount)
+        assertEquals(listOf("policy0(0-5,384-3628MHz)", "policy6(6-7,768-4608MHz)"), probe.cpufreqPolicies)
+
+        val input = sampleInput(
+            debugfsPath = "/sys/kernel/debug",
+            debugfsPrivateNs = false,
+            adjDirPath = "/sys/kernel/debug/custom_vadj",
+            regmapNode = "1-00",
+        )
+        val report = CompatibilityChecker.evaluate(input)
+        val adjItem = report.items.first { it.id == "adj" }
+        val regItem = report.items.first { it.id == "reg7151" }
+        assertTrue(adjItem.detail.contains("/sys/kernel/debug/custom_vadj"))
+        assertTrue(regItem.detail.contains("1-00"))
+
+        val snapshot = sampleSnapshot(input, report, systemProbe = probe)
+        val text = CompatibilityChecker.formatTextReport(snapshot, "0.3.5")
+        assertTrue(text.contains("[全机只读自动探测]"))
+        assertTrue(text.contains("/vendor_dlkm/lib/modules/qcom_voltage_adj.ko"))
+        assertTrue(text.contains("pdp_cdb_a=/dev/block/sde37"))
+        assertTrue(text.contains("policy0(0-5,384-3628MHz)"))
+    }
+
+    @Test
+    fun systemProbeHandlesNoneAndMissingValues() {
+        val probe = SystemProbeParser.parse(
+            probeBlock = """
+                vadj_platform_dev=none
+                vadj_driver=none
+                vadj_spmi_parent=none
+                vadj_dt_path=none
+                vadj_module_loaded=0
+                vadj_module_files=none
+                debugfs_mounts=none
+                debugfs_volt_nodes=none
+                pdp_cdt_partitions=none
+                by_name_dirs=none
+                scmi_drivers=none
+                scmi_device_count=0
+                cpufreq_policies=none
+            """.trimIndent(),
+        )
+        assertFalse(probe.hasAnyData)
+        assertEquals(null, probe.vadjPlatformDevice)
+        assertEquals(null, probe.adjDirPath)
+        assertTrue(probe.vadjModuleFiles.isEmpty())
+        assertTrue(probe.pdpCdtPartitions.isEmpty())
+        assertEquals(0, probe.scmiDeviceCount)
+    }
+
     private fun sampleInput(
         debugfsPath: String? = "/sys/kernel/debug",
         debugfsPrivateNs: Boolean = false,
         pdpFwPath: String? = "/dev/block/by-name/pdp_a",
         pdpHardwareLimits: PdpHardwareLimits? = sampleHardwareLimits(),
         pdpFwError: String? = null,
+        adjDirPath: String? = null,
+        regmapNode: String? = null,
     ): CompatibilityInput = CompatibilityInput(
         socModel = "SM8850",
         isSm8850 = true,
@@ -98,6 +181,8 @@ class CompatibilityCheckerTest {
             ScmiPoint(domain = 0, levelIndex = 0, freqKhz = 384_000L, powerUw = 9_145L, voltageMv = 488, exactFormulaMatch = true),
             ScmiPoint(domain = 1, levelIndex = 0, freqKhz = 768_000L, powerUw = 30_678L, voltageMv = 516, exactFormulaMatch = true),
         ),
+        adjDirPath = adjDirPath,
+        regmapNode = regmapNode,
     )
 
     private fun samplePdpCdb(): PdpCdbData {
@@ -137,6 +222,7 @@ class CompatibilityCheckerTest {
     private fun sampleSnapshot(
         input: CompatibilityInput,
         report: CompatibilityReport,
+        systemProbe: SystemProbeInfo = SystemProbeInfo(),
     ): DeviceSnapshot = DeviceSnapshot(
         bootId = "00000000-0000-0000-0000-000000000000",
         socModel = input.socModel,
@@ -171,6 +257,7 @@ class CompatibilityCheckerTest {
         baselinePoints = input.scmiPoints,
         voltageDiffRows = emptyList(),
         setEstimates = emptyMap(),
+        systemProbe = systemProbe,
         compatibility = report,
     )
 }

@@ -49,6 +49,7 @@ data class DeviceSnapshot(
     val baselinePoints: List<ScmiPoint>?,
     val voltageDiffRows: List<VoltageDiffRow>,
     val setEstimates: Map<Int, SetDeviceEstimate>,
+    val systemProbe: SystemProbeInfo = SystemProbeInfo(),
     val compatibility: CompatibilityReport,
 ) {
     val bootCpussIndex: Int? get() = bootSet.runningIndex

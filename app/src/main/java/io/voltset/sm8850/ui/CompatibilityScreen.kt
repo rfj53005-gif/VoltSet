@@ -3,8 +3,10 @@ package io.voltset.sm8850.ui
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -29,6 +31,10 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -44,6 +50,7 @@ import io.voltset.sm8850.core.CompatibilityCheckItem
 import io.voltset.sm8850.core.CompatibilityChecker
 import io.voltset.sm8850.core.CompatibilityLevel
 import io.voltset.sm8850.core.DeviceSnapshot
+import io.voltset.sm8850.core.SystemProbeInfo
 
 @Composable
 internal fun CompatibilityScreen(
@@ -103,6 +110,12 @@ internal fun CompatibilityScreen(
                         CheckItemRow(item = item)
                     }
                 }
+            }
+        }
+
+        if (snapshot.systemProbe.hasAnyData) {
+            item(key = "compat_system_probe") {
+                SystemProbeCard(snapshot = snapshot)
             }
         }
 
@@ -346,6 +359,150 @@ private fun CheckItemRow(item: CompatibilityCheckItem) {
             text = item.detail,
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun SystemProbeCard(snapshot: DeviceSnapshot) {
+    val semantic = LocalVoltSetColors.current
+    val probe: SystemProbeInfo = snapshot.systemProbe
+    var expanded by rememberSaveable(snapshot.compatibility.level) {
+        mutableStateOf(snapshot.compatibility.level == CompatibilityLevel.UNSUPPORTED)
+    }
+
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, semantic.subtleBorder),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { expanded = !expanded }
+                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Text(
+                        text = "全机只读自动探测",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = "${probe.pdpCdtPartitions.size} 个 PDP/CDT 分区 · " +
+                            "${probe.vadjModuleFiles.size} 个磁盘模块 · " +
+                            "${probe.cpufreqPolicies.size} 个 CPU 簇",
+                        style = MaterialTheme.typography.bodySmall.merge(TabularStyle),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+                Surface(
+                    shape = RoundedCornerShape(6.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                ) {
+                    Text(
+                        text = if (expanded) "收起" else "展开",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                    )
+                }
+            }
+
+            AnimatedVisibility(visible = expanded) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 14.dp, end = 14.dp, bottom = 14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    HorizontalDivider(color = semantic.subtleBorder.copy(alpha = 0.7f))
+                    ProbeInfoRow(
+                        label = "qcom_voltage_adj 目录",
+                        value = probe.adjDirPath ?: "未发现",
+                    )
+                    ProbeInfoRow(
+                        label = "平台设备 / 驱动",
+                        value = probe.vadjPlatformDevice?.let {
+                            "$it (driver=${probe.vadjDriver ?: "unknown"}, spmi=${probe.vadjSpmiParent ?: "unknown"})"
+                        } ?: "未发现",
+                    )
+                    ProbeInfoRow(
+                        label = "设备树路径",
+                        value = probe.vadjDtPath ?: "未发现",
+                    )
+                    ProbeInfoRow(
+                        label = "内核模块",
+                        value = "${if (probe.vadjModuleLoaded) "已加载" else "未加载"}" +
+                            (probe.vadjModuleFiles.takeIf { it.isNotEmpty() }?.let { "\n${it.joinToString("\n")}" } ?: "\n磁盘未发现 *voltage_adj*.ko"),
+                    )
+                    ProbeInfoRow(
+                        label = "PMIC regmap",
+                        value = probe.regmapNode ?: "未命中",
+                    )
+                    ProbeInfoRow(
+                        label = "debugfs 挂载与节点",
+                        value = buildString {
+                            append(probe.debugfsMounts.joinToString(", ").ifEmpty { "未挂载" })
+                            if (probe.debugfsVoltNodes.isNotEmpty()) {
+                                append('\n')
+                                append(probe.debugfsVoltNodes.joinToString("\n"))
+                            }
+                        },
+                    )
+                    ProbeInfoRow(
+                        label = "GPT 发现分区 (pdp/cdt)",
+                        value = probe.pdpCdtPartitions.joinToString("\n").ifEmpty { "未发现" },
+                    )
+                    ProbeInfoRow(
+                        label = "by-name 目录",
+                        value = probe.byNameDirs.joinToString("\n").ifEmpty { "未发现" },
+                    )
+                    ProbeInfoRow(
+                        label = "SCMI 接口",
+                        value = "${probe.scmiDeviceCount} 个设备" +
+                            (probe.scmiDrivers.takeIf { it.isNotEmpty() }?.let { "\n${it.joinToString(", ")}" } ?: ""),
+                    )
+                    ProbeInfoRow(
+                        label = "CPU 调频簇",
+                        value = probe.cpufreqPolicies.joinToString("\n").ifEmpty { "未读取" },
+                    )
+                    Text(
+                        text = "提示：点击顶部「复制检测报告」可一并导出以上全部只读探测路径，便于排查跨机型适配问题。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProbeInfoRow(
+    label: String,
+    value: String,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
         )
     }
 }

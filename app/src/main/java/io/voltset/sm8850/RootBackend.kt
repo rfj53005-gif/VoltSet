@@ -15,6 +15,7 @@ import io.voltset.sm8850.core.PdpFirmwareParser
 import io.voltset.sm8850.core.PdpHardwareLimits
 import io.voltset.sm8850.core.ScmiPlanParser
 import io.voltset.sm8850.core.ScmiQualityReport
+import io.voltset.sm8850.core.SystemProbeParser
 import io.voltset.sm8850.core.VoltageSetEstimator
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -172,6 +173,8 @@ internal class RootBackend(private val context: Context) {
         val adjSetNodePresent = kv["ADJ_SET_NODE"] == "1"
         val debugfsPath = kv["DEBUGFS"]?.takeIf { it != "none" }
         val debugfsPrivateNs = kv["DEBUGFS_PRIVATE_NS"] == "1"
+        val adjDirPath = kv["ADJ_DIR"]?.takeIf { it != "none" && it.isNotBlank() }
+        val regmapNode = kv["REGMAP_NODE"]?.takeIf { it != "none" && it.isNotBlank() }
         val adjError = kv["ADJ_ERROR"]
         val sdamCpussIndex = kv["SDAM_CPUSS_IDX"]?.toIntOrNull()
         val sdamGlobalIndex = kv["SDAM_GLOBAL_IDX"]?.toIntOrNull()
@@ -258,6 +261,11 @@ internal class RootBackend(private val context: Context) {
             baselinePoints = baselinePoints,
             limits = pdpHardwareLimits,
         )
+        val systemProbe = SystemProbeParser.parse(
+            probeBlock = reply.blocks["PROBE"],
+            adjDirPath = adjDirPath,
+            regmapNode = regmapNode,
+        )
 
         val compatibility = CompatibilityChecker.evaluate(
             CompatibilityInput(
@@ -282,6 +290,8 @@ internal class RootBackend(private val context: Context) {
                 scmiModuleAsset = scmiModuleAsset,
                 scmiError = scmiError,
                 scmiPoints = scmiPoints,
+                adjDirPath = adjDirPath,
+                regmapNode = regmapNode,
             ),
         )
 
@@ -319,6 +329,7 @@ internal class RootBackend(private val context: Context) {
             baselinePoints = baselinePoints,
             voltageDiffRows = diffRows,
             setEstimates = setEstimates,
+            systemProbe = systemProbe,
             compatibility = compatibility,
         )
     }

@@ -57,6 +57,8 @@ data class CompatibilityInput(
     val scmiModuleAsset: String?,
     val scmiError: String?,
     val scmiPoints: List<ScmiPoint>,
+    val adjDirPath: String? = null,
+    val regmapNode: String? = null,
 )
 
 /**
@@ -101,15 +103,16 @@ object CompatibilityChecker {
         items += when {
             input.adjAvailable && input.adjSetNodePresent -> {
                 val dbgPath = input.debugfsPath ?: "/sys/kernel/debug"
+                val adjLoc = input.adjDirPath ?: dbgPath
                 val summary = if (input.debugfsPrivateNs) {
                     "读写节点完整（私有 NS 挂载，CPUSS=${input.sdamCpussIndex ?: "?"} / Global=${input.sdamGlobalIndex ?: "?"}）"
                 } else {
                     "读写节点完整（CPUSS=${input.sdamCpussIndex ?: "?"} / Global=${input.sdamGlobalIndex ?: "?"}）"
                 }
                 val detail = if (input.debugfsPrivateNs) {
-                    "系统 init 未默认挂载 debugfs，已通过私有 mount namespace 临时挂载至 $dbgPath（不污染全局挂载表），找到 get_overrides 与 set_overrides。"
+                    "系统 init 未默认挂载 debugfs，已通过私有 mount namespace 临时挂载至 $dbgPath（不污染全局挂载表），在 $adjLoc 找到 get_overrides 与 set_overrides。"
                 } else {
-                    "已在 debugfs (${input.debugfsPath ?: "unknown"}) 找到 get_overrides 与 set_overrides，具备切换 Set 的内核前提。"
+                    "已在 $adjLoc 找到 get_overrides 与 set_overrides，具备切换 Set 的内核前提。"
                 }
                 CompatibilityCheckItem(
                     id = "adj",
@@ -139,6 +142,7 @@ object CompatibilityChecker {
         }
 
         // 3. PMIC regmap 0x7151 cross-check (non-blocking)
+        val rmNode = input.regmapNode ?: "0-00"
         val regHexClean = input.reg7151Hex?.trim()
         val regByte = regHexClean?.toIntOrNull(16)
         val expectedByte = if (input.sdamCpussIndex != null && input.sdamGlobalIndex != null) {
@@ -152,7 +156,7 @@ object CompatibilityChecker {
                 title = "PMIC SDAM 寄存器 (0x7151)",
                 status = CheckStatus.PASS,
                 summary = "0x${regHexClean.uppercase(Locale.US)}（与 get_overrides 完全一致）",
-                detail = "PMK8850 regmap 0-00 寄存器 0x7151 实时字节校验匹配目标格式 (CPUSS/Global valid 位均置 1)。",
+                detail = "PMIC regmap $rmNode 寄存器 0x7151 实时字节校验匹配目标格式 (CPUSS/Global valid 位均置 1)。",
                 blocking = false,
             )
             regByte != null && expectedByte != null -> CompatibilityCheckItem(
@@ -160,7 +164,7 @@ object CompatibilityChecker {
                 title = "PMIC SDAM 寄存器 (0x7151)",
                 status = CheckStatus.WARN,
                 summary = "0x${regHexClean.uppercase(Locale.US)} 与预期 0x%02X 不同".format(Locale.US, expectedByte),
-                detail = "此机型的 PMIC regmap 地址或位掩码布局可能与 Xiaomi SM8850 不同，切换档位后请通过 SCMI 或负载实测确认是否实际生效。",
+                detail = "此机型的 PMIC regmap ($rmNode) 地址或位掩码布局可能与 Xiaomi SM8850 不同，切换档位后请通过 SCMI 或负载实测确认是否实际生效。",
                 blocking = false,
             )
             regByte != null -> CompatibilityCheckItem(
@@ -168,15 +172,15 @@ object CompatibilityChecker {
                 title = "PMIC SDAM 寄存器 (0x7151)",
                 status = CheckStatus.PASS,
                 summary = "0x${regHexClean.uppercase(Locale.US)}",
-                detail = "已读取 PMIC SDAM 寄存器字节。",
+                detail = "已读取 PMIC regmap $rmNode SDAM 寄存器字节。",
                 blocking = false,
             )
             else -> CompatibilityCheckItem(
                 id = "reg7151",
                 title = "PMIC SDAM 寄存器 (0x7151)",
                 status = CheckStatus.WARN,
-                summary = "regmap/0-00/registers 不可读",
-                detail = "无法直接交叉核对 PMIC 0x7151 寄存器字节（该接口对 qcom_voltage_adj 本身工作非必需）。",
+                summary = "regmap/$rmNode/registers 不可读",
+                detail = "无法直接交叉核对 PMIC $rmNode 0x7151 寄存器字节（该接口对 qcom_voltage_adj 本身工作非必需）。",
                 blocking = false,
             )
         }
@@ -419,6 +423,8 @@ object CompatibilityChecker {
             scmiModuleAsset = snapshot.scmiModuleAsset,
             scmiError = snapshot.scmiError,
             scmiPoints = snapshot.scmiPoints,
+            adjDirPath = snapshot.systemProbe.adjDirPath,
+            regmapNode = snapshot.systemProbe.regmapNode,
         ),
     )
 
@@ -443,6 +449,28 @@ object CompatibilityChecker {
         for (item in compat.items) {
             appendLine("- [${item.status}] ${item.title}: ${item.summary}")
             appendLine("  ${item.detail}")
+        }
+        val probe = snapshot.systemProbe
+        if (probe.hasAnyData) {
+            appendLine()
+            appendLine("[全机只读自动探测]")
+            appendLine("debugfs 挂载点: ${probe.debugfsMounts.joinToString(", ").ifEmpty { "none" }}")
+            appendLine("qcom_voltage_adj 目录: ${probe.adjDirPath ?: "none"}")
+            appendLine("debugfs 调压节点: ${probe.debugfsVoltNodes.joinToString(", ").ifEmpty { "none" }}")
+            val devSummary = probe.vadjPlatformDevice?.let {
+                "$it (driver=${probe.vadjDriver ?: "unknown"}, spmi=${probe.vadjSpmiParent ?: "unknown"})"
+            } ?: "none"
+            appendLine("平台设备/驱动: $devSummary")
+            appendLine("设备树路径: ${probe.vadjDtPath ?: "none"}")
+            appendLine(
+                "内核模块: ${if (probe.vadjModuleLoaded) "已加载" else "未加载"} | " +
+                    "磁盘: ${probe.vadjModuleFiles.joinToString(", ").ifEmpty { "none" }}",
+            )
+            appendLine("PMIC regmap 节点: ${probe.regmapNode ?: "none"}")
+            appendLine("GPT 发现分区(pdp/cdt): ${probe.pdpCdtPartitions.joinToString(", ").ifEmpty { "none" }}")
+            appendLine("by-name 目录: ${probe.byNameDirs.joinToString(", ").ifEmpty { "none" }}")
+            appendLine("SCMI 接口: ${probe.scmiDeviceCount} 个设备 | ${probe.scmiDrivers.joinToString(", ").ifEmpty { "none" }}")
+            appendLine("CPU 调频簇: ${probe.cpufreqPolicies.joinToString(", ").ifEmpty { "none" }}")
         }
         val sets = snapshot.pdpCdb?.sets.orEmpty()
         if (sets.isNotEmpty()) {
