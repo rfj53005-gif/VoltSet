@@ -40,6 +40,7 @@ data class CompatibilityInput(
     val isSm8850: Boolean,
     val pageSizeBytes: Int?,
     val debugfsPath: String?,
+    val debugfsPrivateNs: Boolean = false,
     val adjAvailable: Boolean,
     val adjSetNodePresent: Boolean,
     val adjError: String?,
@@ -98,14 +99,27 @@ object CompatibilityChecker {
 
         // 2. Kernel qcom_voltage_adj interface (blocking)
         items += when {
-            input.adjAvailable && input.adjSetNodePresent -> CompatibilityCheckItem(
-                id = "adj",
-                title = "内核 qcom_voltage_adj 接口",
-                status = CheckStatus.PASS,
-                summary = "读写节点完整（CPUSS=${input.sdamCpussIndex ?: "?"} / Global=${input.sdamGlobalIndex ?: "?"}）",
-                detail = "已在 debugfs (${input.debugfsPath ?: "unknown"}) 找到 get_overrides 与 set_overrides，具备切换 Set 的内核前提。",
-                blocking = true,
-            )
+            input.adjAvailable && input.adjSetNodePresent -> {
+                val dbgPath = input.debugfsPath ?: "/sys/kernel/debug"
+                val summary = if (input.debugfsPrivateNs) {
+                    "读写节点完整（私有 NS 挂载，CPUSS=${input.sdamCpussIndex ?: "?"} / Global=${input.sdamGlobalIndex ?: "?"}）"
+                } else {
+                    "读写节点完整（CPUSS=${input.sdamCpussIndex ?: "?"} / Global=${input.sdamGlobalIndex ?: "?"}）"
+                }
+                val detail = if (input.debugfsPrivateNs) {
+                    "系统 init 未默认挂载 debugfs，已通过私有 mount namespace 临时挂载至 $dbgPath（不污染全局挂载表），找到 get_overrides 与 set_overrides。"
+                } else {
+                    "已在 debugfs (${input.debugfsPath ?: "unknown"}) 找到 get_overrides 与 set_overrides，具备切换 Set 的内核前提。"
+                }
+                CompatibilityCheckItem(
+                    id = "adj",
+                    title = "内核 qcom_voltage_adj 接口",
+                    status = CheckStatus.PASS,
+                    summary = summary,
+                    detail = detail,
+                    blocking = true,
+                )
+            }
             input.adjAvailable && !input.adjSetNodePresent -> CompatibilityCheckItem(
                 id = "adj",
                 title = "内核 qcom_voltage_adj 接口",
@@ -388,6 +402,7 @@ object CompatibilityChecker {
             isSm8850 = snapshot.isSm8850,
             pageSizeBytes = snapshot.pageSizeBytes,
             debugfsPath = snapshot.debugfsPath,
+            debugfsPrivateNs = snapshot.debugfsPrivateNs,
             adjAvailable = snapshot.adjAvailable,
             adjSetNodePresent = snapshot.adjSetNodePresent,
             adjError = snapshot.adjError,
@@ -414,6 +429,7 @@ object CompatibilityChecker {
         appendLine("摘要: ${compat.subheadline}")
         appendLine("机型: ${snapshot.deviceModel} (${snapshot.deviceName}) | SoC: ${snapshot.socModel} | Slot: ${snapshot.slotSuffix.ifBlank { "none" }}")
         appendLine("内核: ${snapshot.kernelRelease} | 页大小: ${snapshot.pageSizeBytes?.toString() ?: "unknown"} B")
+        appendLine("debugfs: ${snapshot.debugfsPath ?: "none"}${if (snapshot.debugfsPrivateNs) " (private-ns)" else ""}")
         appendLine("SDAM: ${snapshot.sdamCpussIndex ?: "?"}/${snapshot.sdamGlobalIndex ?: "?"} 0x7151=${snapshot.reg7151Hex ?: "--"}")
         with(snapshot.bootSet) {
             appendLine(

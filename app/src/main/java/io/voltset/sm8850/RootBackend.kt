@@ -171,6 +171,7 @@ internal class RootBackend(private val context: Context) {
         val adjAvailable = kv["ADJ_AVAILABLE"] == "1"
         val adjSetNodePresent = kv["ADJ_SET_NODE"] == "1"
         val debugfsPath = kv["DEBUGFS"]?.takeIf { it != "none" }
+        val debugfsPrivateNs = kv["DEBUGFS_PRIVATE_NS"] == "1"
         val adjError = kv["ADJ_ERROR"]
         val sdamCpussIndex = kv["SDAM_CPUSS_IDX"]?.toIntOrNull()
         val sdamGlobalIndex = kv["SDAM_GLOBAL_IDX"]?.toIntOrNull()
@@ -264,6 +265,7 @@ internal class RootBackend(private val context: Context) {
                 isSm8850 = isSm8850,
                 pageSizeBytes = pageSizeBytes,
                 debugfsPath = debugfsPath,
+                debugfsPrivateNs = debugfsPrivateNs,
                 adjAvailable = adjAvailable,
                 adjSetNodePresent = adjSetNodePresent,
                 adjError = adjError,
@@ -293,6 +295,7 @@ internal class RootBackend(private val context: Context) {
             pageSizeBytes = pageSizeBytes,
             isSm8850 = isSm8850,
             debugfsPath = debugfsPath,
+            debugfsPrivateNs = debugfsPrivateNs,
             adjAvailable = adjAvailable,
             adjSetNodePresent = adjSetNodePresent,
             adjError = adjError,

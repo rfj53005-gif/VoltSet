@@ -4,6 +4,46 @@ PATH=/system/bin
 export PATH
 umask 077
 
+existing_debugfs_has_adj() {
+    local mp
+    [ -e /sys/kernel/debug/qcom_voltage_adj/get_overrides ] && return 0
+    for mp in $(awk '$3 == "debugfs" { print $2 }' /proc/mounts 2>/dev/null || true); do
+        [ -e "$mp/qcom_voltage_adj/get_overrides" ] && return 0
+    done
+    return 1
+}
+
+if [ -z "${VOLTSET_PRIVATE_NS:-}" ] && [ "$(id -u)" = 0 ] && ! existing_debugfs_has_adj; then
+    helper_src="${1:-}/bin/vsetns"
+    if [ -n "${1:-}" ] && [ -r "$helper_src" ]; then
+        mkdir -p /data/adb/voltset 2>/dev/null || true
+        chmod 700 /data/adb/voltset 2>/dev/null || true
+        helper_bin=/data/adb/voltset/vsetns
+        if [ ! -x "$helper_bin" ] || ! cmp -s "$helper_src" "$helper_bin" 2>/dev/null; then
+            helper_tmp="$helper_bin.tmp.$$"
+            if cp "$helper_src" "$helper_tmp" 2>/dev/null &&
+                chmod 700 "$helper_tmp" 2>/dev/null &&
+                mv -f "$helper_tmp" "$helper_bin" 2>/dev/null; then
+                :
+            else
+                rm -f -- "$helper_tmp" 2>/dev/null || true
+            fi
+        fi
+        if [ -x "$helper_bin" ]; then
+            VOLTSET_PRIVATE_NS=1
+            export VOLTSET_PRIVATE_NS
+            exec "$helper_bin" /system/bin/sh "$0" "$@"
+        fi
+    fi
+fi
+
+transient_debugfs=0
+if [ -z "${VOLTSET_PRIVATE_NS:-}" ] && [ "$(id -u)" = 0 ] && ! existing_debugfs_has_adj; then
+    if mount -t debugfs -o nosuid,nodev,noexec debugfs /sys/kernel/debug 2>/dev/null; then
+        transient_debugfs=1
+    fi
+fi
+
 bundle=$1
 action=$2
 shift 2
@@ -35,6 +75,9 @@ unload_scmi() {
 cleanup() {
     rc=$?
     trap - EXIT
+    if [ "${transient_debugfs:-0}" = 1 ]; then
+        umount /sys/kernel/debug 2>/dev/null || rc=1
+    fi
     unload_scmi || {
         printf 'ERROR SCMI 读表模块卸载失败\n' >&2
         rc=1
@@ -320,6 +363,11 @@ case "$action" in
         dbg=
         if dbg=$(find_debugfs); then
             printf 'DEBUGFS=%s\n' "$dbg"
+            if [ "${VOLTSET_PRIVATE_NS:-0}" = 1 ]; then
+                printf 'DEBUGFS_PRIVATE_NS=1\n'
+            else
+                printf 'DEBUGFS_PRIVATE_NS=0\n'
+            fi
             if [ -e "$dbg/qcom_voltage_adj/set_overrides" ]; then
                 printf 'ADJ_SET_NODE=1\n'
             else
@@ -338,9 +386,15 @@ case "$action" in
             fi
         else
             printf 'DEBUGFS=none\n'
+            printf 'DEBUGFS_PRIVATE_NS=0\n'
             printf 'ADJ_SET_NODE=0\n'
             printf 'ADJ_AVAILABLE=0\n'
-            printf 'ADJ_ERROR=未在 debugfs 找到 qcom_voltage_adj 接口\n'
+            if grep -qE '(^|[[:space:]])qcom_voltage_adj([[:space:]]|$)' /proc/modules 2>/dev/null ||
+                ls /vendor/lib/modules/*voltage_adj* >/dev/null 2>&1; then
+                printf 'ADJ_ERROR=已检测到 qcom_voltage_adj 模块，但无法挂载或访问 debugfs 节点（请检查内核 CONFIG_DEBUG_FS 或 SELinux 限制）\n'
+            else
+                printf 'ADJ_ERROR=未在 debugfs 找到 qcom_voltage_adj 接口（内核可能未内置或已裁剪该驱动）\n'
+            fi
         fi
 
         if [ -r "$session/boot-cpuss-idx" ]; then

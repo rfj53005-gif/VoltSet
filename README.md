@@ -8,13 +8,14 @@
 > - 借鉴了其通过 Linux 内核模块只读查询 **SCMI PERF `DESCRIBE_LEVELS`** 功耗表并反推 CPU 计划电压的实测验证方法，以及 Root 后端资产原子部署、文件锁与 `boot_id` 防错重入设计；
 > - 复用了 **SunTuner** 以 `GPL-2.0-only` 协议开源的只读 SCMI 查询内核模块 `qcom-scmi-ro.c` 及预编译 `.ko` 二进制（对应源码、Kbuild `Makefile` 与完整许可证随附于 [`kernel/`](kernel/) 目录）。
 > - 在此基础上，VoltSet 针对 SM8850 固件暴露出的 `qcom_voltage_adj` → `PMK8850 SDAM2` → `pdp_cdb` 原生链路做了完整逆向与动态解析实现。
+> - 感谢 [**articlepp/voltset-sm8850-patch**](https://github.com/articlepp/voltset-sm8850-patch)（`Apache-2.0`）发现部分 SM8850 机型（如 REDMI K100 Pro Max）开机后 `init` 未默认挂载 `debugfs` 的问题，并贡献了基于 `unshare(CLONE_NEWNS) + MS_PRIVATE` 的私有挂载命名空间思路（已原生重构并内置于 [`native/vsetns/`](native/vsetns/)）。
 
 ---
 
 ## 核心功能
 
 - **OEM Set 1–7 档位切换与一键还原**
-  - 动态扫描 `/proc/mounts` 中的 `debugfs` 挂载点（兼容 KernelSU/Magisk 随机路径），读写 `qcom_voltage_adj/get_overrides` 与 `set_overrides`，同步交叉核对 PMIC `regmap/0-00` 寄存器 `0x7151`。
+  - 动态扫描 `/proc/mounts` 中的 `debugfs` 挂载点（兼容 KernelSU/Magisk 随机路径）；若检测到系统 `init` 未挂载 `debugfs`（如 REDMI K100 Pro Max），自动通过内置 16K 页对齐小工具 [`vsetns`](native/vsetns/vsetns.c) 在私有 mount namespace（`CLONE_NEWNS` + `MS_PRIVATE`）内按需临时挂载 `debugfs` 并随即退出销毁，不污染宿主 `/proc/mounts`。读写 `qcom_voltage_adj/get_overrides` 与 `set_overrides`，同步交叉核对 PMIC `regmap/0-00` 寄存器 `0x7151`。
   - 每次打开或返回前台自动检测，分别显示**本次开机档推定**和 **SDAM 当前读回**。重启后比对上次由 VoltSet 写入的档位与本次首次读回，发生差异时显示待确认。
   - 待重启档位可重启核对、撤回或还原默认 Set 1。
   - **不创建任何开机自启脚本**：目标档位保存在 PMIC 硬件 SDAM2 中，重启由引导阶段自动应用。
@@ -145,6 +146,8 @@ $$\text{power\_uW} = \left\lfloor \frac{\text{coeff} \times \text{freq\_kHz} \ti
 
 环境要求：Android SDK 36（含 `build-tools/36.0.0`）与 JDK 17+，在 `local.properties` 配置 `sdk.dir` 后执行：
 
+> `native/vsetns/` 已随附针对 `arm64-v8a` 预编译且符合 16 KB 页大小对齐的 `vsetns` 二进制，如需使用 NDK 重建可执行 `make -C native/vsetns`。
+
 ```sh
 ./gradlew :app:assembleRelease :app:lintRelease
 ```
@@ -162,5 +165,5 @@ $$\text{power\_uW} = \left\lfloor \frac{\text{coeff} \times \text{freq\_kHz} \ti
 
 ## 开源协议
 
-- VoltSet 自有 Android 应用与 Kotlin/Shell 用户态代码采用 [**Apache License 2.0**](LICENSE)。
+- VoltSet 自有 Android 应用、Kotlin/Shell 后端代码及 [`native/vsetns/`](native/vsetns/) 私有命名空间辅助程序采用 [**Apache License 2.0**](LICENSE)。
 - [`kernel/`](kernel/) 目录下的 `qcom-scmi-ro.c` 及预编译内核模块衍生自 [**washyda/SunTuner**](https://github.com/washyda/SunTuner)，继续遵循 [**GNU General Public License v2.0 only (`GPL-2.0-only`)**](kernel/COPYING)。

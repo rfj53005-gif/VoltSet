@@ -11,8 +11,8 @@ android {
         applicationId = "io.voltset.sm8850"
         minSdk = 30
         targetSdk = 36
-        versionCode = providers.gradleProperty("releaseVersionCode").orElse("6").get().toInt()
-        versionName = providers.gradleProperty("releaseVersionName").orElse("0.3.3").get()
+        versionCode = providers.gradleProperty("releaseVersionCode").orElse("7").get().toInt()
+        versionName = providers.gradleProperty("releaseVersionName").orElse("0.3.4").get()
     }
 
     buildTypes {
@@ -56,9 +56,20 @@ val syncKernelModules by tasks.registering(Sync::class) {
     }
 }
 
+val nativeHelpersDir = rootProject.file("native/vsetns/prebuilt")
+val nativeHelperFile = nativeHelpersDir.resolve("arm64-v8a/vsetns")
+
+val syncNativeHelpers by tasks.registering(Sync::class) {
+    from(nativeHelperFile)
+    into(generatedAssets.map { it.dir("backend/bin") })
+    doFirst {
+        check(nativeHelperFile.isFile) { "Missing native helper: $nativeHelperFile" }
+    }
+}
+
 android.sourceSets["main"].assets.directories.add(generatedAssets.get().asFile.path)
 tasks.named("preBuild") {
-    dependsOn(syncKernelModules)
+    dependsOn(syncKernelModules, syncNativeHelpers)
 }
 
 dependencies {

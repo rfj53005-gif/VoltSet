@@ -25,6 +25,7 @@ data class DeviceSnapshot(
     val pageSizeBytes: Int?,
     val isSm8850: Boolean,
     val debugfsPath: String?,
+    val debugfsPrivateNs: Boolean = false,
     val adjAvailable: Boolean,
     val adjSetNodePresent: Boolean,
     val adjError: String?,
