@@ -2,6 +2,7 @@ package io.voltset.sm8850
 
 import android.content.Context
 import android.util.Base64
+import io.voltset.sm8850.core.AdjBackend
 import io.voltset.sm8850.core.BaselineSource
 import io.voltset.sm8850.core.BootSetStatus
 import io.voltset.sm8850.core.CdtInspector
@@ -170,6 +171,11 @@ internal class RootBackend(private val context: Context) {
         val scmiModuleAsset = kv["SCMI_MODULE_ASSET"]?.takeIf { it != "none" && it.isNotBlank() }
         val isSm8850 = socModel.uppercase().startsWith("SM8850")
 
+        val adjBackend = when (kv["ADJ_BACKEND"]) {
+            "debugfs" -> AdjBackend.DEBUGFS
+            "nvmem" -> AdjBackend.NVMEM
+            else -> AdjBackend.NONE
+        }
         val adjAvailable = kv["ADJ_AVAILABLE"] == "1"
         val adjSetNodePresent = kv["ADJ_SET_NODE"] == "1"
         val debugfsPath = kv["DEBUGFS"]?.takeIf { it != "none" }
@@ -280,6 +286,7 @@ internal class RootBackend(private val context: Context) {
                 pageSizeBytes = pageSizeBytes,
                 debugfsPath = debugfsPath,
                 debugfsPrivateNs = debugfsPrivateNs,
+                adjBackend = adjBackend,
                 adjAvailable = adjAvailable,
                 adjSetNodePresent = adjSetNodePresent,
                 adjError = adjError,
@@ -313,6 +320,7 @@ internal class RootBackend(private val context: Context) {
             isSm8850 = isSm8850,
             debugfsPath = debugfsPath,
             debugfsPrivateNs = debugfsPrivateNs,
+            adjBackend = adjBackend,
             adjAvailable = adjAvailable,
             adjSetNodePresent = adjSetNodePresent,
             adjError = adjError,

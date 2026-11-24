@@ -14,6 +14,13 @@ enum class ScmiDataSource {
     KERNEL_MODULE,
 }
 
+/** Which kernel interface is used to read/write PMK8850 SDAM2 (0x7151). */
+enum class AdjBackend {
+    NONE,
+    DEBUGFS,
+    NVMEM,
+}
+
 /** Immediate readback after writing `set_overrides`. */
 data class OverrideWriteResult(
     val sdamCpussIndex: Int,
@@ -33,6 +40,7 @@ data class DeviceSnapshot(
     val isSm8850: Boolean,
     val debugfsPath: String?,
     val debugfsPrivateNs: Boolean = false,
+    val adjBackend: AdjBackend = AdjBackend.NONE,
     val adjAvailable: Boolean,
     val adjSetNodePresent: Boolean,
     val adjError: String?,

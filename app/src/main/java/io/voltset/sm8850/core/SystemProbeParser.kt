@@ -19,13 +19,16 @@ data class SystemProbeInfo(
     val cpufreqPolicies: List<String> = emptyList(),
     val energyModelDomains: List<String> = emptyList(),
     val socInfo: String? = null,
+    val sdam2NvmemPath: String? = null,
+    val sdam2Pmic: String? = null,
 ) {
     val hasAnyData: Boolean
         get() = adjDirPath != null || regmapNode != null || vadjPlatformDevice != null ||
             vadjModuleLoaded || vadjModuleFiles.isNotEmpty() || debugfsMounts.isNotEmpty() ||
             debugfsVoltNodes.isNotEmpty() || pdpCdtPartitions.isNotEmpty() ||
             byNameDirs.isNotEmpty() || scmiDrivers.isNotEmpty() || scmiDeviceCount > 0 ||
-            cpufreqPolicies.isNotEmpty() || energyModelDomains.isNotEmpty() || socInfo != null
+            cpufreqPolicies.isNotEmpty() || energyModelDomains.isNotEmpty() || socInfo != null ||
+            sdam2NvmemPath != null || sdam2Pmic != null
 }
 
 /** Parser for the `PROBE_BEGIN` ... `PROBE_END` section emitted by `voltset.sh status`. */
@@ -62,6 +65,8 @@ object SystemProbeParser {
             cpufreqPolicies = splitCsv(kv["cpufreq_policies"]),
             energyModelDomains = splitCsv(kv["energy_model_domains"]),
             socInfo = cleanScalar(kv["socinfo"]),
+            sdam2NvmemPath = cleanScalar(kv["sdam2_nvmem"]),
+            sdam2Pmic = cleanScalar(kv["sdam2_pmic"]),
         )
     }
 

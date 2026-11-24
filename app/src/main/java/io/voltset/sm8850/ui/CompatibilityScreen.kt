@@ -450,6 +450,12 @@ private fun SystemProbeCard(snapshot: DeviceSnapshot) {
                         value = probe.regmapNode ?: "未命中",
                     )
                     ProbeInfoRow(
+                        label = "PMK8850 SDAM2 (sysfs nvmem)",
+                        value = probe.sdam2NvmemPath?.let { path ->
+                            probe.sdam2Pmic?.let { pmic -> "$path ($pmic)" } ?: path
+                        } ?: "未发现",
+                    )
+                    ProbeInfoRow(
                         label = "debugfs 挂载与节点",
                         value = buildString {
                             append(probe.debugfsMounts.joinToString(", ").ifEmpty { "未挂载" })

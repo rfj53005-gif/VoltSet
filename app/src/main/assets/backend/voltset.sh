@@ -382,6 +382,84 @@ discover_vadj_platform() {
     fi
 }
 
+sdam_nvmem_path=
+sdam_nvmem_dev=
+sdam_nvmem_pmic=
+sdam_byte=
+sdam_hex=
+
+discover_sdam2_nvmem() {
+    local d real dev_dir pmic_dir dev_drv dev_of pmic_spmi pmic_name matched_pmic
+    sdam_nvmem_path=
+    sdam_nvmem_dev=
+    sdam_nvmem_pmic=
+    for d in /sys/bus/nvmem/devices/*sdam*; do
+        [ -e "$d/nvmem" ] || continue
+        real=$(readlink -f "$d" 2>/dev/null || true)
+        [ -n "$real" ] || continue
+        dev_dir=$(dirname "$real")
+        [ -r "$dev_dir/uevent" ] || continue
+        dev_drv=$(awk -F= '$1 == "DRIVER" { print $2; exit }' "$dev_dir/uevent" 2>/dev/null || true)
+        dev_of=$(awk -F= '$1 == "OF_FULLNAME" { print $2; exit }' "$dev_dir/uevent" 2>/dev/null || true)
+        [ "$dev_drv" = "qcom,spmi-sdam" ] || continue
+        case "$dev_of" in
+            */sdam@7100) ;;
+            *) continue ;;
+        esac
+        pmic_dir=$(dirname "$dev_dir")
+        pmic_spmi=$(basename "$pmic_dir")
+        pmic_name=
+        if [ -r "$pmic_dir/uevent" ]; then
+            pmic_name=$(awk -F= '$1 == "OF_NAME" { print $2; exit }' "$pmic_dir/uevent" 2>/dev/null || true)
+        fi
+        matched_pmic=0
+        case "$pmic_name" in
+            [pP][mM][kK]8850*) matched_pmic=1 ;;
+        esac
+        if [ "$matched_pmic" = 0 ] && [ -n "$vadj_spmi_parent" ] && [ "$pmic_spmi" = "$vadj_spmi_parent" ]; then
+            matched_pmic=1
+        fi
+        [ "$matched_pmic" = 1 ] || continue
+        sdam_nvmem_path="$d/nvmem"
+        sdam_nvmem_dev=$(basename "$d")
+        sdam_nvmem_pmic=${pmic_name:-$pmic_spmi}
+        break
+    done
+}
+
+read_sdam2_nvmem_byte() {
+    local path=$1 val
+    sdam_byte=
+    sdam_hex=
+    [ -r "$path" ] || return 1
+    val=$(dd if="$path" bs=1 skip=81 count=1 2>/dev/null | od -An -tu1 | awk 'NF { print $1; exit }' || true)
+    case "$val" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$val" -ge 0 ] && [ "$val" -le 255 ] || return 1
+    sdam_byte=$val
+    sdam_hex=$(printf '%02x' "$val")
+    return 0
+}
+
+read_sdam2_nvmem_overrides() {
+    read_sdam2_nvmem_byte "$1" || return 1
+    [ $(( sdam_byte & 136 )) -eq 136 ] || return 2
+    cpuss_idx=$(( (sdam_byte >> 4) & 7 ))
+    global_idx=$(( sdam_byte & 7 ))
+    case "$cpuss_idx:$global_idx" in
+        [1-7]:[0-7]) return 0 ;;
+        *) return 2 ;;
+    esac
+}
+
+write_sdam2_nvmem_overrides() {
+    local path=$1 target_cpuss=$2 target_global=$3 byte_val oct
+    byte_val=$(( (target_cpuss << 4) | target_global | 136 ))
+    oct=$(printf '%03o' "$byte_val")
+    printf "\\$oct" | dd of="$path" bs=1 seek=81 count=1 conv=notrunc 2>/dev/null
+}
+
 reg_7151=unavailable
 regmap_node=none
 
@@ -430,6 +508,11 @@ read_reg_7151() {
             fi
         done < "$work/debugfs_mounts"
     done
+    if [ -n "$sdam_nvmem_path" ] && [ -r "$sdam_nvmem_path" ] && read_sdam2_nvmem_byte "$sdam_nvmem_path"; then
+        reg_7151=$sdam_hex
+        regmap_node="nvmem:$sdam_nvmem_dev"
+        return 0
+    fi
     return 0
 }
 
@@ -636,6 +719,8 @@ emit_system_probe() {
     printf 'cpufreq_policies=%s\n' "$cpufreq_policies"
     printf 'energy_model_domains=%s\n' "$energy_model_domains"
     printf 'socinfo=%s\n' "$socinfo_str"
+    printf 'sdam2_nvmem=%s\n' "${sdam_nvmem_path:-none}"
+    printf 'sdam2_pmic=%s\n' "${sdam_nvmem_pmic:-none}"
     printf 'PROBE_END\n'
 }
 
@@ -702,6 +787,7 @@ case "$action" in
         fi
 
         discover_vadj_platform
+        discover_sdam2_nvmem
         vadj_mod_loaded=0
         if grep -qE '(^|[[:space:]])qcom_voltage_adj([[:space:]]|$)' /proc/modules 2>/dev/null ||
             [ -d /sys/module/qcom_voltage_adj ] ||
@@ -715,6 +801,7 @@ case "$action" in
         )
 
         if find_adj_pair; then
+            printf 'ADJ_BACKEND=debugfs\n'
             printf 'DEBUGFS=%s\n' "$dbg"
             printf 'ADJ_DIR=%s\n' "$adj_dir"
             if [ "${VOLTSET_PRIVATE_NS:-0}" = 1 ]; then
@@ -738,8 +825,38 @@ case "$action" in
                 printf 'ADJ_AVAILABLE=0\n'
                 printf 'ADJ_ERROR=无法解析 get_overrides 输出\n'
             fi
+        elif [ -n "$sdam_nvmem_path" ] && [ -r "$sdam_nvmem_path" ]; then
+            dbg=$(first_debugfs_mount 2>/dev/null || true)
+            printf 'DEBUGFS=%s\n' "${dbg:-none}"
+            if [ "${VOLTSET_PRIVATE_NS:-0}" = 1 ] && [ -n "$dbg" ]; then
+                printf 'DEBUGFS_PRIVATE_NS=1\n'
+            else
+                printf 'DEBUGFS_PRIVATE_NS=0\n'
+            fi
+            if read_sdam2_nvmem_overrides "$sdam_nvmem_path"; then
+                printf 'ADJ_BACKEND=nvmem\n'
+                printf 'ADJ_DIR=%s\n' "$sdam_nvmem_path"
+                if [ -w "$sdam_nvmem_path" ]; then
+                    printf 'ADJ_SET_NODE=1\n'
+                else
+                    printf 'ADJ_SET_NODE=0\n'
+                fi
+                printf 'ADJ_AVAILABLE=1\n'
+                if [ ! -f "$session/boot-cpuss-idx" ]; then
+                    printf '%s\n' "$cpuss_idx" > "$session/boot-cpuss-idx"
+                fi
+                printf 'SDAM_CPUSS_IDX=%s\n' "$cpuss_idx"
+                printf 'SDAM_GLOBAL_IDX=%s\n' "$global_idx"
+            else
+                printf 'ADJ_BACKEND=none\n'
+                printf 'ADJ_DIR=none\n'
+                printf 'ADJ_SET_NODE=0\n'
+                printf 'ADJ_AVAILABLE=0\n'
+                printf 'ADJ_ERROR=未找到 debugfs/qcom_voltage_adj；虽检测到 %s (0x7151=0x%s)，但有效位 0x88 未置位，为安全起见未启用 nvmem 兜底\n' "$sdam_nvmem_path" "${sdam_hex:-??}"
+            fi
         else
             dbg=$(first_debugfs_mount 2>/dev/null || true)
+            printf 'ADJ_BACKEND=none\n'
             printf 'DEBUGFS=%s\n' "${dbg:-none}"
             printf 'ADJ_DIR=none\n'
             if [ "${VOLTSET_PRIVATE_NS:-0}" = 1 ]; then
@@ -838,29 +955,51 @@ case "$action" in
         case "$target_cpuss" in [1-7]) ;; *) die "CPUSS 档位必须为 1..7" ;; esac
         case "$target_global" in [0-7]) ;; *) die "Global 档位必须为 0..7" ;; esac
 
-        find_adj_pair || die "未找到 debugfs/qcom_voltage_adj 接口"
-        [ -e "$adj_dir/set_overrides" ] || die "缺少 qcom_voltage_adj/set_overrides 节点"
-        [ -r "$adj_dir/get_overrides" ] || die "缺少 qcom_voltage_adj/get_overrides 节点"
-
-        verify_overrides "$adj_dir/get_overrides" "$expected_cpuss" "$target_global"
-        if [ ! -f "$session/boot-cpuss-idx" ]; then
-            printf '%s\n' "$cpuss_idx" > "$session/boot-cpuss-idx"
-        fi
-        printf '%s %s\n' "$boot" "$target_cpuss" > "$work/last-set" || die "无法创建档位记录"
-
-        dec=$(( (target_cpuss << 4) | target_global ))
-        printf '%s\n' "$dec" > "$adj_dir/set_overrides" || die "写入 set_overrides 失败"
-
-        read_overrides_indices "$adj_dir/get_overrides" || die "写入后回读 get_overrides 失败"
-        [ "$cpuss_idx" = "$target_cpuss" ] && [ "$global_idx" = "$target_global" ] ||
-            die "写入校验失败：读回为 CPUSS=$cpuss_idx Global=$global_idx（期望 $target_cpuss/$target_global）"
-        mv "$work/last-set" "$last_set" || die "SDAM 已写入，但无法保存重启核对记录"
-
         discover_vadj_platform
-        read_reg_7151 "$dbg" "$vadj_spmi_parent"
-        printf 'SDAM_CPUSS_IDX=%s\n' "$cpuss_idx"
-        printf 'SDAM_GLOBAL_IDX=%s\n' "$global_idx"
-        printf 'REG_7151=%s\n' "$reg_7151"
+        discover_sdam2_nvmem
+        if find_adj_pair; then
+            [ -e "$adj_dir/set_overrides" ] || die "缺少 qcom_voltage_adj/set_overrides 节点"
+            [ -r "$adj_dir/get_overrides" ] || die "缺少 qcom_voltage_adj/get_overrides 节点"
+
+            verify_overrides "$adj_dir/get_overrides" "$expected_cpuss" "$target_global"
+            if [ ! -f "$session/boot-cpuss-idx" ]; then
+                printf '%s\n' "$cpuss_idx" > "$session/boot-cpuss-idx"
+            fi
+            printf '%s %s\n' "$boot" "$target_cpuss" > "$work/last-set" || die "无法创建档位记录"
+
+            dec=$(( (target_cpuss << 4) | target_global ))
+            printf '%s\n' "$dec" > "$adj_dir/set_overrides" || die "写入 set_overrides 失败"
+
+            read_overrides_indices "$adj_dir/get_overrides" || die "写入后回读 get_overrides 失败"
+            [ "$cpuss_idx" = "$target_cpuss" ] && [ "$global_idx" = "$target_global" ] ||
+                die "写入校验失败：读回为 CPUSS=$cpuss_idx Global=$global_idx（期望 $target_cpuss/$target_global）"
+            mv "$work/last-set" "$last_set" || die "SDAM 已写入，但无法保存重启核对记录"
+
+            read_reg_7151 "$dbg" "$vadj_spmi_parent"
+            printf 'SDAM_CPUSS_IDX=%s\n' "$cpuss_idx"
+            printf 'SDAM_GLOBAL_IDX=%s\n' "$global_idx"
+            printf 'REG_7151=%s\n' "$reg_7151"
+        elif [ -n "$sdam_nvmem_path" ] && [ -r "$sdam_nvmem_path" ] && [ -w "$sdam_nvmem_path" ]; then
+            read_sdam2_nvmem_overrides "$sdam_nvmem_path" || die "未找到 debugfs，且 $sdam_nvmem_path 当前 0x7151 状态未通过安全校验"
+            [ "$cpuss_idx:$global_idx" = "$expected_cpuss:$target_global" ] || die "SDAM 档位已变化，请刷新后重新确认"
+            if [ ! -f "$session/boot-cpuss-idx" ]; then
+                printf '%s\n' "$cpuss_idx" > "$session/boot-cpuss-idx"
+            fi
+            printf '%s %s\n' "$boot" "$target_cpuss" > "$work/last-set" || die "无法创建档位记录"
+
+            write_sdam2_nvmem_overrides "$sdam_nvmem_path" "$target_cpuss" "$target_global" || die "写入 $sdam_nvmem_path (0x7151) 失败"
+
+            read_sdam2_nvmem_overrides "$sdam_nvmem_path" || die "写入后回读 $sdam_nvmem_path 失败"
+            [ "$cpuss_idx" = "$target_cpuss" ] && [ "$global_idx" = "$target_global" ] ||
+                die "写入校验失败：读回为 CPUSS=$cpuss_idx Global=$global_idx（期望 $target_cpuss/$target_global）"
+            mv "$work/last-set" "$last_set" || die "SDAM 已写入，但无法保存重启核对记录"
+
+            printf 'SDAM_CPUSS_IDX=%s\n' "$cpuss_idx"
+            printf 'SDAM_GLOBAL_IDX=%s\n' "$global_idx"
+            printf 'REG_7151=%s\n' "$sdam_hex"
+        else
+            die "未找到 debugfs/qcom_voltage_adj 或可用的 spmi_sdam2/nvmem 接口"
+        fi
         ;;
 
     save_baseline)
@@ -899,8 +1038,16 @@ case "$action" in
     reboot)
         [ "$#" = 3 ] || die "reboot 参数无效"
         [ "$1" = "$boot" ] || die "启动 ID 已改变，请刷新状态"
-        find_adj_pair || die "未找到 debugfs/qcom_voltage_adj 接口"
-        verify_overrides "$adj_dir/get_overrides" "$2" "$3"
+        discover_vadj_platform
+        discover_sdam2_nvmem
+        if find_adj_pair; then
+            verify_overrides "$adj_dir/get_overrides" "$2" "$3"
+        elif [ -n "$sdam_nvmem_path" ] && [ -r "$sdam_nvmem_path" ]; then
+            read_sdam2_nvmem_overrides "$sdam_nvmem_path" || die "无法核对 $sdam_nvmem_path 当前 SDAM 档位，请刷新后重试"
+            [ "$cpuss_idx:$global_idx" = "$2:$3" ] || die "SDAM 档位已变化，请刷新后重新确认"
+        else
+            die "未找到 debugfs/qcom_voltage_adj 或可用的 spmi_sdam2/nvmem 接口"
+        fi
         /system/bin/svc power reboot --no-wait
         ;;
 

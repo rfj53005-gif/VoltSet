@@ -16,6 +16,7 @@
 
 - **OEM Set 1–7 档位切换与一键还原**
   - 动态扫描 `/proc/mounts` 中的 `debugfs` 挂载点（兼容 KernelSU/Magisk 随机路径）；若检测到系统 `init` 未挂载 `debugfs`（如 REDMI K100 Pro Max），自动通过内置 16K 页对齐小工具 [`vsetns`](native/vsetns/vsetns.c) 在私有 mount namespace（`CLONE_NEWNS` + `MS_PRIVATE`）内按需临时挂载 `debugfs` 并随即退出销毁，不污染宿主 `/proc/mounts`。读写 `qcom_voltage_adj/get_overrides` 与 `set_overrides`，同步交叉核对 PMIC `regmap/0-00` 寄存器 `0x7151`。
+  - **无 `debugfs` / 无 `qcom_voltage_adj` 驱动兜底**：当厂商内核彻底关闭 `CONFIG_DEBUG_FS` 或裁剪 `qcom_voltage_adj.ko` 时，自动识别 `sysfs` 中的 `/sys/bus/nvmem/devices/spmi_sdam2/nvmem`（严格校验 `DRIVER=qcom,spmi-sdam`、`sdam@7100`、`pmk8850` 与当前 `0x7151` 有效位 `0x88` 后）直接读写偏移 `0x51`，无需 `debugfs` 或专用驱动即可切换 Set。
   - 每次打开或返回前台自动检测，分别显示**本次开机档推定**和 **SDAM 当前读回**。重启后比对上次由 VoltSet 写入的档位与本次首次读回，发生差异时显示待确认。
   - 待重启档位可重启核对、撤回或还原默认 Set 1。
   - **不创建任何开机自启脚本**：目标档位保存在 PMIC 硬件 SDAM2 中，重启由引导阶段自动应用。
@@ -133,7 +134,7 @@ $$\text{power\_uW} = \left\lfloor \frac{\text{coeff} \times \text{freq\_kHz} \ti
 ## 其他机型能否使用？
 
 可直接安装 APK 并授予 Root 后打开查看（**不点击任何「应用」按钮时全程纯只读**），在底部「**设备检测**」标签页查看自动判定结果：
-1. **阻塞性必要条件**：内核暴露了可读写的 `debugfs/qcom_voltage_adj/{get_overrides,set_overrides}`、设备存在包含非零降压条目的 `pdp_cdb` 分区，且 `OEM_VOLTAGE_ADJUSTMENTS_SET_OVERRIDE == 0`。
+1. **阻塞性必要条件**：内核暴露了可读写的 `debugfs/qcom_voltage_adj/{get_overrides,set_overrides}`（或经安全校验的 `sysfs` `spmi_sdam2/nvmem` `PMK8850 sdam@7100`）、设备存在包含非零降压条目的 `pdp_cdb` 分区，且 `OEM_VOLTAGE_ADJUSTMENTS_SET_OVERRIDE == 0`。
 2. **可选观测条件**：首选 `debugfs/energy_model` 零模块读取电压表，因此即使在 **16K 页**或非 4K GKI 内核上只要内核开启了 Energy Model 即可正常显示实测电压与本机实降范围；仅当同时缺少 `energy_model` 且无法加载 4K `qcom-scmi-ro.ko` 时才会跳过实时电压对比，也**不影响读取 `pdp_cdb` 与切换 Set**。
 3. **跨机型试水建议**：首次测试未知机型请从温和档位（`-4 ~ -12 mV`）开始，重启后核对 SDAM 索引未被引导程序重置、再结合稳定性负载测试逐步下探。
 

@@ -79,6 +79,8 @@ class CompatibilityCheckerTest {
             cpufreq_policies=policy0(0-5,384-3628MHz),policy6(6-7,768-4608MHz)
             energy_model_domains=cpu0(0-5,28),cpu6(6-7,29)
             socinfo=chip=SM8850 foundry=1 feature=3 pcode=2 oem=0 pmic_rev=2.0
+            sdam2_nvmem=/sys/bus/nvmem/devices/spmi_sdam2/nvmem
+            sdam2_pmic=pmk8850
         """.trimIndent()
 
         val probe = SystemProbeParser.parse(
@@ -98,10 +100,13 @@ class CompatibilityCheckerTest {
         assertEquals(listOf("policy0(0-5,384-3628MHz)", "policy6(6-7,768-4608MHz)"), probe.cpufreqPolicies)
         assertEquals(listOf("cpu0(0-5,28)", "cpu6(6-7,29)"), probe.energyModelDomains)
         assertEquals("chip=SM8850 foundry=1 feature=3 pcode=2 oem=0 pmic_rev=2.0", probe.socInfo)
+        assertEquals("/sys/bus/nvmem/devices/spmi_sdam2/nvmem", probe.sdam2NvmemPath)
+        assertEquals("pmk8850", probe.sdam2Pmic)
 
         val input = sampleInput(
             debugfsPath = "/sys/kernel/debug",
             debugfsPrivateNs = false,
+            adjBackend = AdjBackend.DEBUGFS,
             scmiSource = ScmiDataSource.ENERGY_MODEL,
             adjDirPath = "/sys/kernel/debug/custom_vadj",
             regmapNode = "1-00",
@@ -113,7 +118,7 @@ class CompatibilityCheckerTest {
         assertTrue(regItem.detail.contains("1-00"))
 
         val snapshot = sampleSnapshot(input, report, systemProbe = probe)
-        val text = CompatibilityChecker.formatTextReport(snapshot, "0.3.6")
+        val text = CompatibilityChecker.formatTextReport(snapshot, "0.3.7")
         assertTrue(text.contains("[全机只读自动探测]"))
         assertTrue(text.contains("/vendor_dlkm/lib/modules/qcom_voltage_adj.ko"))
         assertTrue(text.contains("pdp_cdb_a=/dev/block/sde37"))
@@ -121,6 +126,40 @@ class CompatibilityCheckerTest {
         assertTrue(text.contains("cpu0(0-5,28), cpu6(6-7,29)"))
         assertTrue(text.contains("chip=SM8850 foundry=1 feature=3 pcode=2 oem=0 pmic_rev=2.0"))
         assertTrue(text.contains("debugfs/energy_model (零内核模块)"))
+        assertTrue(text.contains("/sys/bus/nvmem/devices/spmi_sdam2/nvmem (pmk8850)"))
+    }
+
+    @Test
+    fun nvmemFallbackPassesWithoutDebugfsOrVoltageAdjDriver() {
+        val nvmemPath = "/sys/bus/nvmem/devices/spmi_sdam2/nvmem"
+        val input = sampleInput(
+            debugfsPath = null,
+            debugfsPrivateNs = false,
+            adjBackend = AdjBackend.NVMEM,
+            adjDirPath = nvmemPath,
+            regmapNode = "nvmem:spmi_sdam2",
+        )
+        val report = CompatibilityChecker.evaluate(input)
+        val adjItem = report.items.first { it.id == "adj" }
+        val regItem = report.items.first { it.id == "reg7151" }
+
+        assertEquals(CompatibilityLevel.COMPATIBLE, report.level)
+        assertEquals(CheckStatus.PASS, adjItem.status)
+        assertTrue(adjItem.summary.contains("sysfs nvmem 兜底直通"))
+        assertTrue(adjItem.detail.contains(nvmemPath))
+        assertTrue(adjItem.detail.contains("0x51"))
+        assertEquals(CheckStatus.PASS, regItem.status)
+        assertTrue(regItem.detail.contains("nvmem:spmi_sdam2"))
+
+        val probe = SystemProbeInfo(
+            adjDirPath = nvmemPath,
+            regmapNode = "nvmem:spmi_sdam2",
+            sdam2NvmemPath = nvmemPath,
+            sdam2Pmic = "pmk8850",
+        )
+        val text = CompatibilityChecker.formatTextReport(sampleSnapshot(input, report, systemProbe = probe), "0.3.7")
+        assertTrue(text.contains("调压读写通道: sysfs spmi_sdam2/nvmem (sdam@7100+0x51)"))
+        assertTrue(text.contains("$nvmemPath (pmk8850)"))
     }
 
     @Test
@@ -170,6 +209,7 @@ class CompatibilityCheckerTest {
         pageSizeBytes: Int? = 4096,
         debugfsPath: String? = "/sys/kernel/debug",
         debugfsPrivateNs: Boolean = false,
+        adjBackend: AdjBackend = AdjBackend.DEBUGFS,
         pdpFwPath: String? = "/dev/block/by-name/pdp_a",
         pdpHardwareLimits: PdpHardwareLimits? = sampleHardwareLimits(),
         pdpFwError: String? = null,
@@ -183,6 +223,7 @@ class CompatibilityCheckerTest {
         pageSizeBytes = pageSizeBytes,
         debugfsPath = debugfsPath,
         debugfsPrivateNs = debugfsPrivateNs,
+        adjBackend = adjBackend,
         adjAvailable = true,
         adjSetNodePresent = true,
         adjError = null,
@@ -262,6 +303,7 @@ class CompatibilityCheckerTest {
         isSm8850 = input.isSm8850,
         debugfsPath = input.debugfsPath,
         debugfsPrivateNs = input.debugfsPrivateNs,
+        adjBackend = input.adjBackend,
         adjAvailable = input.adjAvailable,
         adjSetNodePresent = input.adjSetNodePresent,
         adjError = input.adjError,

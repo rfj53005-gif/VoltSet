@@ -41,6 +41,7 @@ data class CompatibilityInput(
     val pageSizeBytes: Int?,
     val debugfsPath: String?,
     val debugfsPrivateNs: Boolean = false,
+    val adjBackend: AdjBackend = AdjBackend.NONE,
     val adjAvailable: Boolean,
     val adjSetNodePresent: Boolean,
     val adjError: String?,
@@ -100,20 +101,21 @@ object CompatibilityChecker {
             )
         }
 
-        // 2. Kernel qcom_voltage_adj interface (blocking)
+        // 2. Kernel qcom_voltage_adj / SDAM2 nvmem interface (blocking)
         items += when {
             input.adjAvailable && input.adjSetNodePresent -> {
                 val dbgPath = input.debugfsPath ?: "/sys/kernel/debug"
                 val adjLoc = input.adjDirPath ?: dbgPath
-                val summary = if (input.debugfsPrivateNs) {
-                    "读写节点完整（私有 NS 挂载，CPUSS=${input.sdamCpussIndex ?: "?"} / Global=${input.sdamGlobalIndex ?: "?"}）"
-                } else {
-                    "读写节点完整（CPUSS=${input.sdamCpussIndex ?: "?"} / Global=${input.sdamGlobalIndex ?: "?"}）"
-                }
-                val detail = if (input.debugfsPrivateNs) {
-                    "系统 init 未默认挂载 debugfs，已通过私有 mount namespace 临时挂载至 $dbgPath（不污染全局挂载表），在 $adjLoc 找到 get_overrides 与 set_overrides。"
-                } else {
-                    "已在 $adjLoc 找到 get_overrides 与 set_overrides，具备切换 Set 的内核前提。"
+                val (summary, detail) = when {
+                    input.adjBackend == AdjBackend.NVMEM ->
+                        "sysfs nvmem 兜底直通（CPUSS=${input.sdamCpussIndex ?: "?"} / Global=${input.sdamGlobalIndex ?: "?"}）" to
+                            "未检测到 debugfs/qcom_voltage_adj，已通过已校验的 PMK8850 sdam@7100 (${input.adjDirPath ?: "/sys/bus/nvmem/devices/spmi_sdam2/nvmem"}) 偏移 0x51 读写 0x7151（不依赖 debugfs 与 qcom_voltage_adj 驱动）。"
+                    input.debugfsPrivateNs ->
+                        "读写节点完整（私有 NS 挂载，CPUSS=${input.sdamCpussIndex ?: "?"} / Global=${input.sdamGlobalIndex ?: "?"}）" to
+                            "系统 init 未默认挂载 debugfs，已通过私有 mount namespace 临时挂载至 $dbgPath（不污染全局挂载表），在 $adjLoc 找到 get_overrides 与 set_overrides。"
+                    else ->
+                        "读写节点完整（CPUSS=${input.sdamCpussIndex ?: "?"} / Global=${input.sdamGlobalIndex ?: "?"}）" to
+                            "已在 $adjLoc 找到 get_overrides 与 set_overrides，具备切换 Set 的内核前提。"
                 }
                 CompatibilityCheckItem(
                     id = "adj",
@@ -416,6 +418,7 @@ object CompatibilityChecker {
             pageSizeBytes = snapshot.pageSizeBytes,
             debugfsPath = snapshot.debugfsPath,
             debugfsPrivateNs = snapshot.debugfsPrivateNs,
+            adjBackend = snapshot.adjBackend,
             adjAvailable = snapshot.adjAvailable,
             adjSetNodePresent = snapshot.adjSetNodePresent,
             adjError = snapshot.adjError,
@@ -464,6 +467,12 @@ object CompatibilityChecker {
         if (probe.hasAnyData) {
             appendLine()
             appendLine("[全机只读自动探测]")
+            val adjBackendStr = when (snapshot.adjBackend) {
+                AdjBackend.DEBUGFS -> "debugfs/qcom_voltage_adj"
+                AdjBackend.NVMEM -> "sysfs spmi_sdam2/nvmem (sdam@7100+0x51)"
+                AdjBackend.NONE -> "none"
+            }
+            appendLine("调压读写通道: $adjBackendStr")
             appendLine("debugfs 挂载点: ${probe.debugfsMounts.joinToString(", ").ifEmpty { "none" }}")
             appendLine("qcom_voltage_adj 目录: ${probe.adjDirPath ?: "none"}")
             appendLine("debugfs 调压节点: ${probe.debugfsVoltNodes.joinToString(", ").ifEmpty { "none" }}")
@@ -477,6 +486,10 @@ object CompatibilityChecker {
                     "磁盘: ${probe.vadjModuleFiles.joinToString(", ").ifEmpty { "none" }}",
             )
             appendLine("PMIC regmap 节点: ${probe.regmapNode ?: "none"}")
+            appendLine(
+                "PMK8850 SDAM2 nvmem: " +
+                    (probe.sdam2NvmemPath?.let { p -> probe.sdam2Pmic?.let { "$p ($it)" } ?: p } ?: "none"),
+            )
             appendLine("GPT 发现分区(pdp/cdt): ${probe.pdpCdtPartitions.joinToString(", ").ifEmpty { "none" }}")
             appendLine("by-name 目录: ${probe.byNameDirs.joinToString(", ").ifEmpty { "none" }}")
             appendLine("SCMI 接口: ${probe.scmiDeviceCount} 个设备 | ${probe.scmiDrivers.joinToString(", ").ifEmpty { "none" }}")
