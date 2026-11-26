@@ -1,0 +1,6 @@
+id=voltset
+name=VoltSet SM8850
+version=v0.5.3
+versionCode=15
+author=rfj53005-gif
+description=Qualcomm SM8850 OEM CPU Set (1-7) undervolt controller, SCMI voltage table, QPT hardware power monitor, and CPRH silicon calibration via KernelSU WebUI.
