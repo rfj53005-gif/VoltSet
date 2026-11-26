@@ -502,6 +502,14 @@ object CompatibilityChecker {
             appendLine("电压表来源: $scmiSourceStr")
             appendLine("energy_model 域: ${probe.energyModelDomains.joinToString(", ").ifEmpty { "none" }}")
             appendLine("硅片信息 (socinfo): ${probe.socInfo ?: "none"}")
+            appendLine(
+                "QFPROM 老化熔丝 (0xA10/0xA20): " + (
+                    probe.qfpromAging?.let {
+                        "clus0=${it.clus0FusedDelta}, clus1=${it.clus1FusedDelta} (${it.formatRawHex()})"
+                    } ?: "none"
+                    ),
+            )
+            appendLine("QPT 硬件功耗轨: ${probe.qptRails.joinToString(", ").ifEmpty { "none" }}")
         }
         val sets = snapshot.pdpCdb?.sets.orEmpty()
         if (sets.isNotEmpty()) {

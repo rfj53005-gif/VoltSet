@@ -4,6 +4,55 @@ PATH=/system/bin
 export PATH
 umask 077
 
+if [ "${2:-}" = "power_enable" ]; then
+    [ "$(id -u)" = 0 ] || { printf 'ERROR 需要 Root 权限\n' >&2; exit 1; }
+    qpt_en=/sys/class/powercap/qpt/enabled
+    if [ -r "$qpt_en" ]; then
+        cur=$(cat "$qpt_en" 2>/dev/null || echo 1)
+        if [ "$cur" = "0" ] && [ -w "$qpt_en" ]; then
+            printf '1\n' > "$qpt_en" 2>/dev/null || { printf 'ERROR 无法开启 QPT 硬件功耗遥测\n' >&2; exit 1; }
+            printf 'QPT_CHANGED=1\n'
+        else
+            printf 'QPT_CHANGED=0\n'
+        fi
+        printf 'QPT_ENABLED=%s\n' "$(cat "$qpt_en" 2>/dev/null || echo 0)"
+    else
+        printf 'QPT_CHANGED=0\nQPT_ENABLED=1\n'
+    fi
+    exit 0
+fi
+
+if [ "${2:-}" = "power_disable" ]; then
+    [ "$(id -u)" = 0 ] || { printf 'ERROR 需要 Root 权限\n' >&2; exit 1; }
+    qpt_en=/sys/class/powercap/qpt/enabled
+    if [ -w "$qpt_en" ]; then
+        printf '0\n' > "$qpt_en" 2>/dev/null || true
+    fi
+    printf 'QPT_ENABLED=%s\n' "$(cat "$qpt_en" 2>/dev/null || echo 0)"
+    exit 0
+fi
+
+if [ "${2:-}" = "power_sample" ]; then
+    [ "$(id -u)" = 0 ] || { printf 'ERROR 需要 Root 权限\n' >&2; exit 1; }
+    for d in /sys/class/powercap/qpt:0:[0-9]*; do
+        [ -r "$d/name" ] && [ -r "$d/energy_uj" ] || continue
+        rname=$(cat "$d/name" 2>/dev/null || true)
+        renergy=$(cat "$d/energy_uj" 2>/dev/null || true)
+        [ -n "$rname" ] && [ -n "$renergy" ] && printf 'QPT_RAIL=%s:%s\n' "$rname" "$renergy"
+        if [ -r "$d/power_uw" ]; then
+            rpower=$(cat "$d/power_uw" 2>/dev/null || true)
+            [ -n "$rname" ] && [ -n "$rpower" ] && printf 'QPT_POWER_UW=%s:%s\n' "$rname" "$rpower"
+        fi
+    done
+    p0=$(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq 2>/dev/null || true)
+    p6=$(cat /sys/devices/system/cpu/cpufreq/policy6/scaling_cur_freq 2>/dev/null || true)
+    gpu=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null || true)
+    printf 'FREQ_CPU0_KHZ=%s\n' "${p0:-0}"
+    printf 'FREQ_CPU1_KHZ=%s\n' "${p6:-0}"
+    printf 'FREQ_GPU_HZ=%s\n' "${gpu:-0}"
+    exit 0
+fi
+
 existing_debugfs_has_adj() {
     local mp hit
     [ -e /sys/kernel/debug/qcom_voltage_adj/get_overrides ] && return 0
@@ -625,6 +674,7 @@ emit_system_probe() {
     local debugfs_mounts debugfs_volt_nodes pdp_cdt_partitions by_name_dirs scmi_drivers scmi_count cpufreq_policies
     local energy_model_domains em_dir socinfo_dir socinfo_str pair f k v cpu cdir cnt
     local d p n c mn mx
+    local qa10 qa20_pair qfprom_aging qpt_rails rn
 
     debugfs_mounts=$(awk '$3 == "debugfs" { print $2 }' /proc/mounts 2>/dev/null | join_lines_csv)
     if [ -n "$hint_dbg" ] && [ -d "$hint_dbg" ]; then
@@ -703,6 +753,27 @@ emit_system_probe() {
         socinfo_str=none
     fi
 
+    if [ -r /sys/bus/nvmem/devices/qfprom0/nvmem ]; then
+        qa10=$(dd if=/sys/bus/nvmem/devices/qfprom0/nvmem bs=4 skip=644 count=1 2>/dev/null | od -An -tx4 | awk 'NF { print $1; exit }' || true)
+        qa20_pair=$(dd if=/sys/bus/nvmem/devices/qfprom0/nvmem bs=4 skip=648 count=2 2>/dev/null | od -An -tx4 | awk '{ for (i=1; i<=NF; i++) printf "%s%s", (c++ ? "," : ""), $i }' || true)
+        case "$qa10:$qa20_pair" in
+            [0-9a-fA-F]*:[0-9a-fA-F]*,[0-9a-fA-F]*) qfprom_aging="$qa10,$qa20_pair" ;;
+            *) qfprom_aging=none ;;
+        esac
+    else
+        qfprom_aging=none
+    fi
+    qpt_rails=$(
+        for d in /sys/class/powercap/qpt:0:[0-9]*; do
+            [ -r "$d/name" ] && [ -r "$d/energy_uj" ] || continue
+            rn=$(cat "$d/name" 2>/dev/null || true)
+            case "$rn" in
+                ''|debug-*) continue ;;
+                *) printf '%s\n' "$rn" ;;
+            esac
+        done | join_lines_csv
+    )
+
     printf 'PROBE_BEGIN\n'
     printf 'vadj_platform_dev=%s\n' "${vadj_platform_dev:-none}"
     printf 'vadj_driver=%s\n' "${vadj_driver:-none}"
@@ -719,6 +790,8 @@ emit_system_probe() {
     printf 'cpufreq_policies=%s\n' "$cpufreq_policies"
     printf 'energy_model_domains=%s\n' "$energy_model_domains"
     printf 'socinfo=%s\n' "$socinfo_str"
+    printf 'qfprom_aging=%s\n' "$qfprom_aging"
+    printf 'qpt_rails=%s\n' "$qpt_rails"
     printf 'sdam2_nvmem=%s\n' "${sdam_nvmem_path:-none}"
     printf 'sdam2_pmic=%s\n' "${sdam_nvmem_pmic:-none}"
     printf 'PROBE_END\n'

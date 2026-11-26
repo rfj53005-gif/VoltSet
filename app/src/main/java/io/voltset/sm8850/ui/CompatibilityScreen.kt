@@ -33,6 +33,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -50,6 +51,8 @@ import io.voltset.sm8850.core.CompatibilityCheckItem
 import io.voltset.sm8850.core.CompatibilityChecker
 import io.voltset.sm8850.core.CompatibilityLevel
 import io.voltset.sm8850.core.DeviceSnapshot
+import io.voltset.sm8850.core.QfpromAgingFuses
+import io.voltset.sm8850.core.SocInfoFields
 import io.voltset.sm8850.core.SystemProbeInfo
 
 @Composable
@@ -110,6 +113,15 @@ internal fun CompatibilityScreen(
                         CheckItemRow(item = item)
                     }
                 }
+            }
+        }
+
+        if (snapshot.systemProbe.socInfo != null || snapshot.systemProbe.qfpromAging != null) {
+            item(key = "compat_silicon_calibration") {
+                SiliconCalibrationCard(
+                    socInfoRaw = snapshot.systemProbe.socInfo,
+                    qfprom = snapshot.systemProbe.qfpromAging,
+                )
             }
         }
 
@@ -490,6 +502,16 @@ private fun SystemProbeCard(snapshot: DeviceSnapshot) {
                         label = "硅片信息 (qcom_socinfo)",
                         value = probe.socInfo ?: "未读取",
                     )
+                    ProbeInfoRow(
+                        label = "QFPROM 老化熔丝 (qfprom0)",
+                        value = probe.qfpromAging?.let {
+                            "clus0=${formatSignedDelta(it.clus0FusedDelta)}, clus1=${formatSignedDelta(it.clus1FusedDelta)}\n${it.formatRawHex()}"
+                        } ?: "未读取",
+                    )
+                    ProbeInfoRow(
+                        label = "QPT 硬件功耗轨 (powercap)",
+                        value = probe.qptRails.joinToString(", ").ifEmpty { "未发现" },
+                    )
                     Text(
                         text = "提示：点击顶部「复制检测报告」可一并导出以上全部只读探测路径，便于排查跨机型适配问题。",
                         style = MaterialTheme.typography.labelSmall,
@@ -520,6 +542,89 @@ private fun ProbeInfoRow(
         )
     }
 }
+
+@Composable
+private fun SiliconCalibrationCard(
+    socInfoRaw: String?,
+    qfprom: QfpromAgingFuses?,
+) {
+    val semantic = LocalVoltSetColors.current
+    val soc = remember(socInfoRaw) { SocInfoFields.parse(socInfoRaw) }
+
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, semantic.subtleBorder),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                text = "芯片体质与 CPRH 老化校准",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+
+            if (soc != null) {
+                val cells = buildList {
+                    soc.chipId?.let { add("Chip ID" to it) }
+                    soc.foundryId?.let { add("Foundry" to it) }
+                    soc.pcode?.let { add("PCode" to it) }
+                    soc.pmicRev?.let { add("PMIC Rev" to it) }
+                    soc.featureCode?.let { add("Feature" to it) }
+                    soc.oemVariant?.let { add("OEM" to it) }
+                }
+                for (pair in cells.chunked(2)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        for ((label, value) in pair) {
+                            MetaBox(label = label, value = value, modifier = Modifier.weight(1f))
+                        }
+                        if (pair.size == 1) {
+                            Spacer(Modifier.weight(1f))
+                        }
+                    }
+                }
+            }
+
+            if (qfprom != null) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    MetaBox(
+                        label = "小核 PDP0 老化熔丝",
+                        value = formatSignedDelta(qfprom.clus0FusedDelta),
+                        modifier = Modifier.weight(1f),
+                    )
+                    MetaBox(
+                        label = "大核 PDP1 老化熔丝",
+                        value = formatSignedDelta(qfprom.clus1FusedDelta),
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Text(
+                    text = "原始熔丝 0xA10/0xA20/0xA24：${qfprom.formatRawHex()}",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = "说明：每次冷启时 PDP0 CPRH 会重测片上老化环形振荡器、减去上述出厂熔丝参考值并截断在 0..+15 mV 后四舍五入至 4 mV 步进；因此即使固定 Set 1，不同冷启间也属正常范围内的 ±4 mV 波动。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+private fun formatSignedDelta(value: Int): String =
+    if (value > 0) "+$value" else value.toString()
 
 private data class CompatColors<A, B, C, D>(
     val bg: A,

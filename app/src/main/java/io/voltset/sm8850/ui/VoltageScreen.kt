@@ -23,6 +23,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
@@ -49,10 +50,14 @@ import io.voltset.sm8850.R
 import io.voltset.sm8850.VoltSetUiState
 import io.voltset.sm8850.core.BaselineSource
 import io.voltset.sm8850.core.ClusterVoltageStats
+import io.voltset.sm8850.core.CprhDriftAssessment
 import io.voltset.sm8850.core.DeviceSnapshot
+import io.voltset.sm8850.core.SavedSetPowerRecord
 import io.voltset.sm8850.core.ScmiDataSource
 import io.voltset.sm8850.core.ScmiPlanParser
 import io.voltset.sm8850.core.VoltageDiffRow
+import java.util.Locale
+import kotlin.math.roundToInt
 
 @Composable
 internal fun VoltageScreen(
@@ -60,6 +65,11 @@ internal fun VoltageScreen(
     snapshot: DeviceSnapshot,
     onSelectClusterFilter: (Int?) -> Unit,
     onCaptureBaseline: () -> Unit,
+    onToggleQptMonitor: () -> Unit,
+    onResetQptSession: () -> Unit,
+    onSavePowerRecord: () -> Unit,
+    onDeletePowerRecord: (Int) -> Unit,
+    onClearPowerRecords: () -> Unit,
     onShowMessage: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -96,6 +106,22 @@ internal fun VoltageScreen(
                 controlsEnabled = state.controlsEnabled,
                 onCaptureBaseline = onCaptureBaseline,
             )
+        }
+
+        if (snapshot.systemProbe.qptRails.isNotEmpty() || state.savedPowerRecords.isNotEmpty()) {
+            item(key = "qpt_power") {
+                Box(Modifier.padding(top = 12.dp)) {
+                    QptPowerCard(
+                        state = state,
+                        bootSetId = snapshot.bootCpussIndex,
+                        onToggleMonitor = onToggleQptMonitor,
+                        onResetSession = onResetQptSession,
+                        onSaveRecord = onSavePowerRecord,
+                        onDeleteRecord = onDeletePowerRecord,
+                        onClearRecords = onClearPowerRecords,
+                    )
+                }
+            }
         }
 
         if (snapshot.scmiError != null) {
@@ -313,13 +339,38 @@ private fun ScmiSummaryCard(
                 )
             }
 
-            if (snapshot.canSaveStockBaseline && snapshot.baselineSource != BaselineSource.VOLTSET) {
+            val cprhDrift = remember(snapshot.bootCpussIndex, snapshot.voltageDiffRows) {
+                CprhDriftAssessment.assess(snapshot.bootCpussIndex, snapshot.voltageDiffRows)
+            }
+            if (cprhDrift.isLikelyCprhDrift) {
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        text = "Set 1 检测到 ${cprhDrift.affectedBins} 个频点出现 ${formatRange(cprhDrift.minDeltaMv, cprhDrift.maxDeltaMv)} 偏移：" +
+                            "这是每次冷启 PDP0 CPRH 老化传感器重测并在 4 mV 步进取整引起的正常校准波动，可点击下方按钮以本次冷启刷新原厂基线。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        modifier = Modifier.padding(10.dp),
+                    )
+                }
+            }
+
+            if (snapshot.canSaveStockBaseline) {
                 OutlinedButton(
                     onClick = onCaptureBaseline,
                     enabled = controlsEnabled,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Text("在 Set 1 采集并保存为 VoltSet 原厂基线")
+                    Text(
+                        if (snapshot.baselineSource == BaselineSource.VOLTSET) {
+                            "刷新 Set 1 原厂基线（以本次冷启为准）"
+                        } else {
+                            "在 Set 1 采集并保存为 VoltSet 原厂基线"
+                        },
+                    )
                 }
             } else if (snapshot.baselineSource == BaselineSource.NONE) {
                 Text(
@@ -553,3 +604,303 @@ private fun VoltageRowItem(
         }
     }
 }
+
+@Composable
+private fun QptPowerCard(
+    state: VoltSetUiState,
+    bootSetId: Int?,
+    onToggleMonitor: () -> Unit,
+    onResetSession: () -> Unit,
+    onSaveRecord: () -> Unit,
+    onDeleteRecord: (Int) -> Unit,
+    onClearRecords: () -> Unit,
+) {
+    val semantic = LocalVoltSetColors.current
+    val instant = state.qptInstant
+    val session = state.qptSession
+    val records = remember(state.savedPowerRecords) {
+        state.savedPowerRecords.values.sortedBy { it.setId }
+    }
+    val baseRecord = state.savedPowerRecords[1]
+
+    Card(
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(
+            width = if (state.qptMonitoring) 1.5.dp else 1.dp,
+            color = if (state.qptMonitoring) MaterialTheme.colorScheme.primary else semantic.subtleBorder,
+        ),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = "硬件实时功耗 (QPT)",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    val subtitle = when {
+                        session != null -> "已采样 ${session.sampleCount} 次 · ${session.elapsedSec.roundToInt()}s" +
+                            (bootSetId?.let { " · Set $it" } ?: "")
+                        state.qptMonitoring -> "正在等待首次双点采样…"
+                        else -> "每秒读取硬件能量计数器 · 仅监测时运行"
+                    }
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.bodySmall.merge(TabularStyle),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+                if (state.qptMonitoring) {
+                    OutlinedButton(onClick = onToggleMonitor) {
+                        Text("停止监测")
+                    }
+                } else {
+                    Button(
+                        onClick = onToggleMonitor,
+                        enabled = state.snapshot?.systemProbe?.qptRails?.isNotEmpty() == true,
+                    ) {
+                        Text("开始监测")
+                    }
+                }
+            }
+
+            state.qptError?.let { err ->
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = semantic.warnContainer,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        text = err,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = semantic.onWarnContainer,
+                        modifier = Modifier.padding(8.dp),
+                    )
+                }
+            }
+
+            if (instant != null || state.qptMonitoring) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    QptRailBox(
+                        title = "中核 cpu-m",
+                        powerMw = instant?.cpuMidMw,
+                        freqText = instant?.cpu0FreqKhz?.takeIf { it > 0 }?.let { "${it / 1000} MHz" },
+                        modifier = Modifier.weight(1f),
+                    )
+                    QptRailBox(
+                        title = "大核 cpu-l",
+                        powerMw = instant?.cpuLargeMw,
+                        freqText = instant?.cpu1FreqKhz?.takeIf { it > 0 }?.let { "${it / 1000} MHz" },
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    QptRailBox(
+                        title = "GPU",
+                        powerMw = instant?.gpuMw,
+                        freqText = instant?.gpuFreqHz?.takeIf { it > 0L }?.let { "${it / 1_000_000L} MHz" },
+                        modifier = Modifier.weight(1f),
+                    )
+                    QptRailBox(
+                        title = "CPU 合计",
+                        powerMw = instant?.cpuTotalMw,
+                        freqText = instant?.nspMw?.takeIf { it >= 1.0 }?.let { "NSP ${it.roundToInt()} mW" },
+                        highlighted = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+
+            if (session != null) {
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            text = "本轮均值：CPU 合计 ${formatMw(session.avgCpuTotalMw)}" +
+                                "（中核 ${formatMw(session.avgCpuMidMw)} / 大核 ${formatMw(session.avgCpuLargeMw)}）" +
+                                " · GPU ${formatMw(session.avgGpuMw)}",
+                            style = MaterialTheme.typography.bodySmall.merge(TabularStyle),
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            TextButton(onClick = onResetSession) {
+                                Text("重置统计")
+                            }
+                            OutlinedButton(
+                                onClick = onSaveRecord,
+                                enabled = bootSetId != null && session.sampleCount >= 3,
+                            ) {
+                                Text(bootSetId?.let { "记录为 Set $it 均功耗" } ?: "档位待确认")
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (records.isNotEmpty()) {
+                HorizontalDivider(color = semantic.subtleBorder.copy(alpha = 0.7f))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "各档位实测均功耗对比",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    TextButton(onClick = onClearRecords) {
+                        Text("清空")
+                    }
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    for (record in records) {
+                        SavedPowerRecordRow(
+                            record = record,
+                            baselineRecord = if (record.setId != 1) baseRecord else null,
+                            onDelete = { onDeleteRecord(record.setId) },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun QptRailBox(
+    title: String,
+    powerMw: Double?,
+    freqText: String?,
+    modifier: Modifier = Modifier,
+    highlighted: Boolean = false,
+) {
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = if (highlighted) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+        contentColor = if (highlighted) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
+        modifier = modifier,
+    ) {
+        Column(
+            modifier = Modifier.padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (highlighted) {
+                    MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f)
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+            Text(
+                text = formatMw(powerMw),
+                style = MaterialTheme.typography.titleMedium.merge(TabularStyle),
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                text = freqText ?: "--",
+                style = MaterialTheme.typography.labelSmall.merge(TabularStyle),
+                color = if (highlighted) {
+                    MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f)
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun SavedPowerRecordRow(
+    record: SavedSetPowerRecord,
+    baselineRecord: SavedSetPowerRecord?,
+    onDelete: () -> Unit,
+) {
+    val semantic = LocalVoltSetColors.current
+    val deltaMw = baselineRecord?.let { record.avgCpuTotalMw - it.avgCpuTotalMw }
+    val deltaPct = if (baselineRecord != null && baselineRecord.avgCpuTotalMw > 0 && deltaMw != null) {
+        deltaMw * 100.0 / baselineRecord.avgCpuTotalMw.toDouble()
+    } else {
+        null
+    }
+
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    text = "Set ${record.setId} · CPU ${record.avgCpuTotalMw} mW (${record.elapsedSec}s)",
+                    style = MaterialTheme.typography.bodySmall.merge(TabularStyle),
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = "中核 ${record.avgCpuMidMw} · 大核 ${record.avgCpuLargeMw} · GPU ${record.avgGpuMw} mW",
+                    style = MaterialTheme.typography.labelSmall.merge(TabularStyle),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (deltaMw != null && deltaPct != null) {
+                val (bg, fg) = when {
+                    deltaMw < 0 -> semantic.goodContainer to semantic.onGoodContainer
+                    deltaMw > 0 -> semantic.warnContainer to semantic.onWarnContainer
+                    else -> MaterialTheme.colorScheme.surface to MaterialTheme.colorScheme.onSurfaceVariant
+                }
+                val sign = if (deltaMw > 0) "+" else ""
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(bg)
+                        .padding(horizontal = 7.dp, vertical = 3.dp),
+                ) {
+                    Text(
+                        text = String.format(Locale.US, "%s%d mW (%s%.1f%%)", sign, deltaMw, sign, deltaPct),
+                        style = MaterialTheme.typography.labelSmall.merge(TabularStyle),
+                        fontWeight = FontWeight.SemiBold,
+                        color = fg,
+                    )
+                }
+            }
+            TextButton(onClick = onDelete) {
+                Text("删除")
+            }
+        }
+    }
+}
+
+private fun formatMw(value: Double?): String =
+    value?.let { "${it.roundToInt()} mW" } ?: "-- mW"

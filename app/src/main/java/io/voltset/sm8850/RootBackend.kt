@@ -1,6 +1,7 @@
 package io.voltset.sm8850
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Base64
 import io.voltset.sm8850.core.AdjBackend
 import io.voltset.sm8850.core.BaselineSource
@@ -14,6 +15,8 @@ import io.voltset.sm8850.core.PdpCdbData
 import io.voltset.sm8850.core.PdpCdbParser
 import io.voltset.sm8850.core.PdpFirmwareParser
 import io.voltset.sm8850.core.PdpHardwareLimits
+import io.voltset.sm8850.core.QptPowerParser
+import io.voltset.sm8850.core.QptRawSample
 import io.voltset.sm8850.core.ScmiDataSource
 import io.voltset.sm8850.core.ScmiPlanParser
 import io.voltset.sm8850.core.ScmiQualityReport
@@ -22,11 +25,8 @@ import io.voltset.sm8850.core.VoltageSetEstimator
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.IOException
-import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPInputStream
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 
 internal class RootBackend(private val context: Context) {
@@ -111,32 +111,25 @@ internal class RootBackend(private val context: Context) {
         execute(listOf("reboot", bootId, expectedCpussIndex.toString(), globalIndex.toString()))
     }
 
+    suspend fun enableQptIfNeeded(): Boolean {
+        val output = execute(listOf("power_enable"))
+        return BackendOutput(output).values["QPT_CHANGED"] == "1"
+    }
+
+    suspend fun disableQpt() {
+        execute(listOf("power_disable"))
+    }
+
+    suspend fun readPowerSample(): QptRawSample {
+        val output = execute(listOf("power_sample"))
+        return QptPowerParser.parseSample(output, SystemClock.elapsedRealtimeNanos())
+    }
+
     private suspend fun execute(args: List<String>): String = withContext(Dispatchers.IO) {
         val command = listOf(
-            "/system/bin/timeout", "-k", "2s", "20s",
             "/system/bin/sh", File(bundle, "voltset.sh").path, bundle.path,
         ) + args
-        val quoted = command.joinToString(" ") { shellQuote(it) }
-        val outputFile = File.createTempFile("voltset-", ".log", context.cacheDir)
-        try {
-            val process = try {
-                ProcessBuilder("su", "-c", quoted)
-                    .redirectErrorStream(true)
-                    .redirectOutput(outputFile)
-                    .start()
-            } catch (e: IOException) {
-                throw IllegalStateException("无法启动 Root 请求，请检查 KernelSU 或 Magisk 授权", e)
-            }
-            val exitCode = try {
-                process.outputStream.close()
-                check(runInterruptible { process.waitFor(30, TimeUnit.SECONDS) }) {
-                    "Root 请求超时，请检查授权后刷新"
-                }
-                process.exitValue()
-            } finally {
-                if (process.isAlive) process.destroyForcibly()
-            }
-            check(exitCode != 124 && exitCode != 137) { "读取或执行超时，请刷新后重试" }
+        runRootCommand(context.cacheDir, command) { outputFile, exitCode, _ ->
             check(outputFile.length() <= MAX_BACKEND_OUTPUT_BYTES) { "Root 后端返回的数据超出预期" }
             val output = outputFile.readText()
             if (exitCode != 0) {
@@ -153,8 +146,6 @@ internal class RootBackend(private val context: Context) {
                 error(msg)
             }
             output
-        } finally {
-            outputFile.delete()
         }
     }
 
@@ -402,7 +393,6 @@ internal class RootBackend(private val context: Context) {
         return Base64.decode(rawB64, Base64.DEFAULT)
     }
 
-    private fun shellQuote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
 
     companion object {
         private const val MAX_BACKEND_OUTPUT_BYTES = 4 * 1024 * 1024

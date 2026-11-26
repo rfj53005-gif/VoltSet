@@ -1,5 +1,7 @@
 package io.voltset.sm8850.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -35,6 +37,8 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import io.voltset.sm8850.GpuEditorState
+import io.voltset.sm8850.GpuEditorViewModel
 import io.voltset.sm8850.R
 import io.voltset.sm8850.VoltSetTab
 import io.voltset.sm8850.VoltSetUiState
@@ -43,6 +47,8 @@ import io.voltset.sm8850.VoltSetUiState
 @Composable
 internal fun VoltSetApp(
     state: VoltSetUiState,
+    gpuState: GpuEditorState,
+    gpuModel: GpuEditorViewModel,
     onRefresh: () -> Unit,
     onSelectTab: (VoltSetTab) -> Unit,
     onSelectClusterFilter: (Int?) -> Unit,
@@ -55,11 +61,26 @@ internal fun VoltSetApp(
     onConfirmReboot: () -> Unit,
     onDismissRebootConfirm: () -> Unit,
     onCaptureBaseline: () -> Unit,
+    onToggleQptMonitor: () -> Unit,
+    onResetQptSession: () -> Unit,
+    onSavePowerRecord: () -> Unit,
+    onDeletePowerRecord: (Int) -> Unit,
+    onClearPowerRecords: () -> Unit,
     onShowMessage: (String) -> Unit,
     onConsumeSnackbar: () -> Unit,
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
     val tabs = rememberSaveableStateHolder()
+    val showingGpu = state.selectedTab == VoltSetTab.GPU
+    val gpuConfigInput = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let(gpuModel::importConfig)
+    }
+    val gpuConfigOutput = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        uri?.let(gpuModel::exportConfig)
+    }
+    val gpuImageOutput = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        uri?.let(gpuModel::exportImage)
+    }
 
     LaunchedEffect(state.snackbarMessage) {
         val msg = state.snackbarMessage ?: return@LaunchedEffect
@@ -79,7 +100,7 @@ internal fun VoltSetApp(
                                 fontWeight = FontWeight.Bold,
                             )
                             val snap = state.snapshot
-                            val subtitle = state.busyAction ?: when {
+                            val subtitle = if (showingGpu) "Adreno GPU 调参" else state.busyAction ?: when {
                                 state.loading -> "正在检测设备状态…"
                                 snap != null -> "${snap.socModel} · ${snap.deviceModel}"
                                 else -> "SM8850 OEM 调压"
@@ -95,8 +116,8 @@ internal fun VoltSetApp(
                     },
                     actions = {
                         IconButton(
-                            onClick = onRefresh,
-                            enabled = !state.busy,
+                            onClick = if (showingGpu) gpuModel::refresh else onRefresh,
+                            enabled = if (showingGpu) !gpuState.busy && !gpuState.stressRunning else !state.busy,
                         ) {
                             Icon(
                                 painter = painterResource(R.drawable.ic_refresh),
@@ -105,7 +126,7 @@ internal fun VoltSetApp(
                         }
                     },
                 )
-                if (state.busy) {
+                if (if (showingGpu) gpuState.busy else state.busy) {
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                 }
             }
@@ -135,6 +156,17 @@ internal fun VoltSetApp(
                     label = { Text("SCMI 电压") },
                 )
                 NavigationBarItem(
+                    selected = showingGpu,
+                    onClick = { onSelectTab(VoltSetTab.GPU) },
+                    icon = {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_gpu),
+                            contentDescription = null,
+                        )
+                    },
+                    label = { Text("GPU") },
+                )
+                NavigationBarItem(
                     selected = state.selectedTab == VoltSetTab.COMPAT,
                     onClick = { onSelectTab(VoltSetTab.COMPAT) },
                     icon = {
@@ -151,6 +183,17 @@ internal fun VoltSetApp(
     ) { innerPadding ->
         val snap = state.snapshot
         when {
+            showingGpu -> tabs.SaveableStateProvider(VoltSetTab.GPU.name) {
+                GpuEditorScreen(
+                    state = gpuState,
+                    model = gpuModel,
+                    onPickConfig = { gpuConfigInput.launch(arrayOf("application/json", "text/plain", "application/octet-stream", "application/gzip")) },
+                    onSaveConfig = { gpuConfigOutput.launch(it) },
+                    onSaveImage = { gpuImageOutput.launch(it) },
+                    modifier = Modifier.fillMaxSize().padding(innerPadding),
+                )
+            }
+
             snap == null && state.loading -> {
                 Box(
                     modifier = Modifier
@@ -227,6 +270,11 @@ internal fun VoltSetApp(
                                 snapshot = snap,
                                 onSelectClusterFilter = onSelectClusterFilter,
                                 onCaptureBaseline = onCaptureBaseline,
+                                onToggleQptMonitor = onToggleQptMonitor,
+                                onResetQptSession = onResetQptSession,
+                                onSavePowerRecord = onSavePowerRecord,
+                                onDeletePowerRecord = onDeletePowerRecord,
+                                onClearPowerRecords = onClearPowerRecords,
                                 onShowMessage = onShowMessage,
                             )
                             VoltSetTab.COMPAT -> CompatibilityScreen(
@@ -235,6 +283,7 @@ internal fun VoltSetApp(
                                 onRefresh = onRefresh,
                                 onShowMessage = onShowMessage,
                             )
+                            VoltSetTab.GPU -> Unit
                         }
                     }
                 }
