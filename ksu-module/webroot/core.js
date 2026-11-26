@@ -1818,6 +1818,47 @@
     return tenths === 0 ? `${whole} MHz` : `${whole}.${tenths} MHz`;
   }
 
+  function parseAutoRestoreConfig(raw) {
+    const out = { enabled: false, targetSet: null };
+    if (!raw || !String(raw).trim()) return out;
+    for (const line of String(raw).split(/\r?\n/)) {
+      const eq = line.indexOf('=');
+      if (eq <= 0) continue;
+      const k = line.slice(0, eq).trim();
+      const v = line.slice(eq + 1).trim();
+      if (k === 'enabled') out.enabled = v === '1';
+      else if (k === 'target_set') {
+        const n = Number.parseInt(v, 10);
+        if (Number.isFinite(n) && n >= 2 && n <= 7) out.targetSet = n;
+      }
+    }
+    return out;
+  }
+
+  function serializeAutoRestoreConfig(cfg) {
+    const enabled = cfg && cfg.enabled && cfg.targetSet >= 2 && cfg.targetSet <= 7 ? 1 : 0;
+    const target = cfg && cfg.targetSet >= 2 && cfg.targetSet <= 7 ? cfg.targetSet : '';
+    return `enabled=${enabled}\ntarget_set=${target}\n`;
+  }
+
+  function parseAutoRestoreStatus(raw) {
+    if (!raw || !String(raw).trim()) return null;
+    const kv = Object.create(null);
+    for (const line of String(raw).split(/\r?\n/)) {
+      const eq = line.indexOf('=');
+      if (eq > 0) kv[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+    }
+    if (!kv.action && !kv.detail) return null;
+    return {
+      bootId: kv.boot_id || null,
+      time: kv.time || null,
+      action: kv.action || null,
+      targetSet: parseIntInRange(kv.target_set, 1, 7),
+      observedSet: parseIntInRange(kv.observed_set, 0, 7),
+      detail: kv.detail || null,
+    };
+  }
+
   return {
     parseBackendOutput,
     base64ToBytes,
@@ -1847,6 +1888,9 @@
     formatTextReport,
     buildDeviceSnapshot,
     enrichSnapshotHelpers,
+    parseAutoRestoreConfig,
+    serializeAutoRestoreConfig,
+    parseAutoRestoreStatus,
     formatSignedMv,
     formatRange,
     formatFreqMhz,

@@ -2,10 +2,12 @@
   'use strict';
 
   const C = window.VoltSetCore;
-  const APP_VERSION = 'v0.5.3 (KSU WebUI)';
+  const APP_VERSION = 'v0.5.4 (KSU WebUI)';
   const RESOLVE_BUNDLE =
     'MOD=/data/adb/modules/voltset; [ -r "$MOD/backend/voltset.sh" ] || MOD=/data/adb/modules_update/voltset; BUNDLE="$MOD/backend"; SH="$BUNDLE/voltset.sh"';
   const POWER_RECORDS_FILE = '/data/adb/voltset/persistent/power-records.csv';
+  const AUTO_RESTORE_CONF = '/data/adb/voltset/persistent/auto-restore.conf';
+  const AUTO_RESTORE_STATUS = '/data/adb/voltset/persistent/auto-restore.status';
   const LOCAL_STORAGE_KEY = 'voltset_ksu_power_records_v1';
   const CHUNK_SIZE = 65536;
 
@@ -17,6 +19,8 @@
     snapshot: null,
     clusterFilter: null,
     expandedSets: new Set(),
+    autoRestore: { enabled: false, targetSet: null },
+    autoRestoreStatus: null,
     qptMonitoring: false,
     qptInstant: null,
     qptSession: null,
@@ -183,6 +187,34 @@
     return C.enrichSnapshotHelpers(updated);
   }
 
+  async function loadAutoRestoreState() {
+    try {
+      const confRes = await ksuExec(`cat '${AUTO_RESTORE_CONF}' 2>/dev/null || true`, 5000);
+      if (confRes.errno === 0) state.autoRestore = C.parseAutoRestoreConfig(confRes.stdout);
+    } catch (_) {}
+    try {
+      const stRes = await ksuExec(`cat '${AUTO_RESTORE_STATUS}' 2>/dev/null || true`, 5000);
+      if (stRes.errno === 0) state.autoRestoreStatus = C.parseAutoRestoreStatus(stRes.stdout);
+    } catch (_) {}
+  }
+
+  async function saveAutoRestoreConfig(enabled, targetSet, quiet = false) {
+    const cleanTarget = targetSet >= 2 && targetSet <= 7 ? targetSet : null;
+    const cfg = { enabled: Boolean(enabled && cleanTarget), targetSet: cleanTarget };
+    const text = C.serializeAutoRestoreConfig(cfg);
+    const b64 = btoa(text);
+    const res = await ksuExec(
+      `mkdir -p /data/adb/voltset/persistent && printf '%s' '${b64}' | base64 -d > '${AUTO_RESTORE_CONF}.tmp' && mv '${AUTO_RESTORE_CONF}.tmp' '${AUTO_RESTORE_CONF}'`,
+      5000
+    );
+    if (res.errno !== 0) throw new Error('保存开机自动写入配置失败');
+    state.autoRestore = cfg;
+    if (!quiet) {
+      showToast(cfg.enabled ? `已开启开机自动写入：每次开机写入 Set ${cfg.targetSet}` : '已关闭开机自动写入');
+    }
+    render();
+  }
+
   async function refresh() {
     if (state.loading || state.busyAction) return;
     state.loading = true;
@@ -190,6 +222,7 @@
     render();
     try {
       await loadSavedPowerRecords();
+      await loadAutoRestoreState();
       const raw = await runBackendStatusChunked();
       let snap = await C.buildDeviceSnapshot(raw);
       if (snap.canSaveStockBaseline && snap.baselineSource !== 'VOLTSET') {
@@ -418,7 +451,19 @@
       };
       updated.compatibility = C.evaluateCompatibility(updated);
       state.snapshot = C.enrichSnapshotHelpers(updated);
-      showToast(state.snapshot.pendingReboot ? `已写入 Set ${newCpuss}，下次开机核对` : `SDAM 已读回 Set ${newCpuss}`);
+      let syncNote = '';
+      if (newCpuss === 1 && state.autoRestore.enabled) {
+        try {
+          await saveAutoRestoreConfig(false, state.autoRestore.targetSet, true);
+          syncNote = '（已同时关闭开机自动写入）';
+        } catch (_) {}
+      } else if (newCpuss >= 2 && newCpuss <= 7 && state.autoRestore.enabled) {
+        try {
+          await saveAutoRestoreConfig(true, newCpuss, true);
+          syncNote = `（开机自动写入已同步为 Set ${newCpuss}）`;
+        } catch (_) {}
+      }
+      showToast((state.snapshot.pendingReboot ? `已写入 Set ${newCpuss}，下次开机核对` : `SDAM 已读回 Set ${newCpuss}`) + syncNote);
     } catch (e) {
       state.error = e.message || '写入结果未确认，请刷新核对';
     } finally {
@@ -628,8 +673,64 @@
     `;
   }
 
+  function renderAutoRestoreCard(snap, controlsEnabled) {
+    const sets = (snap.pdpCdb ? snap.pdpCdb.sets : []).filter((s) => s.setId >= 2 && s.setId <= 7);
+    const defaultTarget =
+      state.autoRestore.targetSet ||
+      (snap.sdamCpussIndex >= 2 && snap.sdamCpussIndex <= 7 ? snap.sdamCpussIndex : null) ||
+      (snap.bootCpussIndex >= 2 && snap.bootCpussIndex <= 7 ? snap.bootCpussIndex : null) ||
+      (sets.length ? sets[sets.length - 1].setId : 2);
+
+    let blockReason = null;
+    if (!snap.canWriteOverrides) blockReason = '缺少 SDAM 写入权限或接口';
+    else if (snap.overrideLockedByFirmware) blockReason = 'pdp_cdb 固件已强制锁档';
+    else if (snap.cdtStatus.key7Enabled) blockReason = '检测到 CDT Key 7 开启（叠加降压危险）';
+    else if (snap.compatibility.level === 'UNSUPPORTED') blockReason = '当前设备兼容性检测未通过';
+    else if (!sets.length) blockReason = '未检测到 Set 2..7 档位';
+
+    const ar = state.autoRestore;
+    const chipHtml = ar.enabled && ar.targetSet
+      ? `<span class="chip good tnum">已开启 · Set ${ar.targetSet}</span>`
+      : '<span class="chip">已关闭</span>';
+
+    const optionsHtml = sets
+      .map((s) => `<option value="${s.setId}" ${s.setId === defaultTarget ? 'selected' : ''}>Set ${s.setId}</option>`)
+      .join('');
+
+    const st = state.autoRestoreStatus;
+    const lastLine = st && st.detail
+      ? `<div class="subbox"><div class="label-xs">上次开机执行（${esc(st.time || '--')}）</div><div style="font-size:12px">${esc(st.detail)}</div></div>`
+      : '';
+
+    return `
+      <div class="card">
+        <div class="row-between">
+          <div>
+            <div class="title-sm">每次开机自动写入 Set（boot-completed）</div>
+            <div class="muted" style="font-size:12px">针对断电或部分机型系统重置 SDAM2 导致的掉档</div>
+          </div>
+          ${chipHtml}
+        </div>
+        ${blockReason ? `<div class="banner warn">${esc(blockReason)}</div>` : ''}
+        <div class="row-between">
+          <div class="row">
+            <span class="muted">目标档位</span>
+            <select id="autoRestoreSelect" ${!controlsEnabled || Boolean(blockReason) ? 'disabled' : ''}>
+              ${optionsHtml}
+            </select>
+          </div>
+          <button type="button" id="autoRestoreToggleBtn" class="${ar.enabled ? '' : 'primary'}" ${
+            !controlsEnabled || (!ar.enabled && Boolean(blockReason)) ? 'disabled' : ''
+          }>${ar.enabled ? '关闭开机自动写' : '开启开机自动写'}</button>
+        </div>
+        ${lastLine}
+        <div class="muted" style="font-size:12px">开启后每次开机完成都会向 SDAM2 重新写入目标 Set 并做回读校验（绝不自动重启）。注：SDAM2 写入在下次重启生效；若机型在 Bootloader 阶段即清零 SDAM，则无法靠系统脚本拦截当次开机。</div>
+      </div>
+    `;
+  }
+
   function renderSetsTab(snap, controlsEnabled) {
-    const out = [renderHeroSetsCard(snap, controlsEnabled)];
+    const out = [renderHeroSetsCard(snap, controlsEnabled), renderAutoRestoreCard(snap, controlsEnabled)];
     if (snap.pdpCdbError && !snap.pdpCdb) {
       out.push(`<div class="card warn-box"><div class="title-sm">无法解析 pdp_cdb 固件档位</div><div style="font-size:13px">${esc(snap.pdpCdbError)}</div></div>`);
     }
@@ -1150,6 +1251,34 @@
     document.querySelectorAll('.apply-set-btn').forEach((btn) => {
       btn.onclick = () => openApplyModal(Number.parseInt(btn.dataset.setId, 10));
     });
+    const arSel = document.getElementById('autoRestoreSelect');
+    if (arSel) {
+      arSel.onchange = async () => {
+        const chosen = Number.parseInt(arSel.value, 10);
+        if (!(chosen >= 2 && chosen <= 7)) return;
+        try {
+          if (state.autoRestore.enabled) {
+            await saveAutoRestoreConfig(true, chosen);
+          } else {
+            state.autoRestore = { enabled: false, targetSet: chosen };
+          }
+        } catch (e) {
+          showToast(e.message || '保存配置失败');
+        }
+      };
+    }
+    const arBtn = document.getElementById('autoRestoreToggleBtn');
+    if (arBtn) {
+      arBtn.onclick = async () => {
+        const selVal = arSel ? Number.parseInt(arSel.value, 10) : state.autoRestore.targetSet;
+        const target = selVal >= 2 && selVal <= 7 ? selVal : state.autoRestore.targetSet || 2;
+        try {
+          await saveAutoRestoreConfig(!state.autoRestore.enabled, target);
+        } catch (e) {
+          showToast(e.message || '更新开机自动写失败');
+        }
+      };
+    }
     document.querySelectorAll('.set-details').forEach((det) => {
       det.ontoggle = () => {
         const id = Number.parseInt(det.dataset.setId, 10);

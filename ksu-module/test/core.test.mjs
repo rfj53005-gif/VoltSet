@@ -90,6 +90,30 @@ test('SCMI quality solver and BootSetStatus match Kotlin semantics', () => {
   assert.equal(boot.pendingIndex(7), 7);
 });
 
+test('Auto-restore config & status parsing round-trips cleanly', () => {
+  const cfgText = C.serializeAutoRestoreConfig({ enabled: true, targetSet: 6 });
+  assert.equal(cfgText, 'enabled=1\ntarget_set=6\n');
+  const parsed = C.parseAutoRestoreConfig(cfgText);
+  assert.equal(parsed.enabled, true);
+  assert.equal(parsed.targetSet, 6);
+  assert.deepEqual(C.parseAutoRestoreConfig(''), { enabled: false, targetSet: null });
+
+  const st = C.parseAutoRestoreStatus(
+    [
+      'boot_id=1f44d065-7924-430c-95d1-e1ae9c464720',
+      'time=2026-11-26 20:25:00',
+      'action=refreshed',
+      'target_set=6',
+      'observed_set=6',
+      'detail=本次开机已重新写入并回读确认 Set 6',
+    ].join('\n')
+  );
+  assert.equal(st.action, 'refreshed');
+  assert.equal(st.targetSet, 6);
+  assert.equal(st.observedSet, 6);
+  assert.equal(st.detail, '本次开机已重新写入并回读确认 Set 6');
+});
+
 const liveFile = process.env.VOLTSET_LIVE_STATUS_FILE;
 test('End-to-end live status snapshot parity (when VOLTSET_LIVE_STATUS_FILE is provided)', { skip: !liveFile }, async () => {
   const raw = fs.readFileSync(liveFile, 'utf8');

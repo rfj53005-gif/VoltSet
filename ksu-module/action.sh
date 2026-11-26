@@ -2,6 +2,9 @@
 MODDIR=${0%/*}
 BUNDLE="$MODDIR/backend"
 SH="$BUNDLE/voltset.sh"
+PERSISTENT=/data/adb/voltset/persistent
+CONF="$PERSISTENT/auto-restore.conf"
+STATUS="$PERSISTENT/auto-restore.status"
 
 if [ ! -r "$SH" ]; then
     echo "VoltSet 后端脚本不存在：$SH"
@@ -42,6 +45,30 @@ echo "=== VoltSet 状态摘要（只读） ==="
         if (socinfo != "") printf "硅片: %s\n", socinfo
         if (qfprom != "") printf "老化熔丝: %s\n", qfprom
         if (qpt != "") printf "QPT 功耗轨: %s\n", qpt
-        printf "请在 KernelSU 管理器打开 VoltSet WebUI 进行完整查看与调压。\n"
     }
 '
+
+auto_en=0
+auto_target=
+if [ -r "$CONF" ]; then
+    while IFS='=' read -r k v; do
+        case "$k" in
+            enabled) auto_en=$(printf '%s' "$v" | tr -cd '0-9') ;;
+            target_set) auto_target=$(printf '%s' "$v" | tr -cd '0-9') ;;
+        esac
+    done < "$CONF"
+fi
+if [ "$auto_en" = 1 ] && [ -n "$auto_target" ]; then
+    printf '开机自动写 Set: 已开启 (目标 Set %s)\n' "$auto_target"
+else
+    printf '开机自动写 Set: 已关闭\n'
+fi
+
+if [ -r "$STATUS" ]; then
+    last_time=$(awk -F= '$1 == "time" { print $2; exit }' "$STATUS" 2>/dev/null || true)
+    last_detail=$(awk -F= '$1 == "detail" { sub(/^detail=/, ""); print; exit }' "$STATUS" 2>/dev/null || true)
+    if [ -n "$last_detail" ]; then
+        printf '上次开机执行: [%s] %s\n' "${last_time:-?}" "$last_detail"
+    fi
+fi
+echo "请在 KernelSU 管理器打开 VoltSet WebUI 进行完整查看与调压。"

@@ -211,6 +211,17 @@
     }
     button.full { width: 100%; }
     button:disabled { opacity: 0.45; cursor: default; }
+    select {
+      border: 1px solid var(--border);
+      background: var(--surface-var);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 8px 12px;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    select:disabled { opacity: 0.45; }
     .filter-chips { display: flex; flex-wrap: wrap; gap: 8px; }
     .filter-chip {
       padding: 6px 12px;
