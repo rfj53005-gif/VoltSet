@@ -9,6 +9,20 @@ import org.junit.Test
 
 class QptPowerMonitorTest {
     @Test
+    fun streamingFramesUseTheSamplersTimestamp() {
+        val first = QptPowerParser.parseStreamFrame("QPT_SAMPLE_NS=2000000000\tQPT_RAIL=cpu-m:100")
+        val last = QptPowerParser.parseStreamFrame(
+            "QPT_SAMPLE_NS=3000000000\tQPT_RAIL=cpu-m:200100\tFREQ_CPU0_KHZ=1650000",
+        )
+
+        val delta = checkNotNull(QptPowerParser.computeDelta(checkNotNull(first), checkNotNull(last)))
+        assertEquals(200.0, checkNotNull(delta.cpuMidMw), 0.01)
+        assertEquals(1650000, delta.cpu0FreqKhz)
+        assertNull(QptPowerParser.parseStreamFrame("QPT_SAMPLE_NS=2000000000\tFREQ_CPU0_KHZ=1650000"))
+        assertNull(QptPowerParser.parseStreamFrame("QPT_SAMPLE_NS=invalid\tQPT_RAIL=cpu-m:100"))
+    }
+
+    @Test
     fun parseSampleSkipsDebugRailsAndParsesFrequencies() {
         val raw = """
             QPT_RAIL=cpu-m:503016512
@@ -107,5 +121,56 @@ class QptPowerMonitorTest {
         assertEquals(250.0, delta.cpuMidMw!!, 0.01)
         // gpu did not advance -> falls back to QPT_POWER_UW=42,000 uW -> 42 mW
         assertEquals(42.0, delta.gpuMw!!, 0.01)
+    }
+
+    @Test
+    fun tempCpuMcAndTwelveColumnCsvPlusLegacyNineColumnBackwardCompatibility() {
+        val first = QptPowerParser.parseStreamFrame(
+            "QPT_SAMPLE_NS=1000000000\tQPT_RAIL=cpu-m:100000\tQPT_RAIL=cpu-l:200000\tTEMP_CPU_MC=41500",
+        )!!
+        val second = QptPowerParser.parseStreamFrame(
+            "QPT_SAMPLE_NS=2000000000\tQPT_RAIL=cpu-m:500000\tQPT_RAIL=cpu-l:800000\tFREQ_CPU0_KHZ=1800000\tFREQ_CPU1_KHZ=2400000\tTEMP_CPU_MC=43250",
+        )!!
+        assertEquals(41.5, first.cpuTempC!!, 0.001)
+        assertEquals(43.25, second.cpuTempC!!, 0.001)
+
+        val delta = QptPowerParser.computeDelta(first, second)!!
+        assertEquals(43.25, delta.cpuTempC!!, 0.001)
+
+        val stats = QptPowerParser.summarizeSession(
+            listOf(
+                delta,
+                QptInstantPower(
+                    cpuMidMw = 600.0,
+                    cpuLargeMw = 800.0,
+                    gpuMw = 120.0,
+                    nspMw = 0.0,
+                    cpu0FreqKhz = 2000000,
+                    cpu1FreqKhz = 2800000,
+                    cpuTempC = 45.25,
+                    dtMs = 1000L,
+                ),
+            ),
+        )!!
+        assertEquals(1900, stats.avgCpu0Mhz)
+        assertEquals(2600, stats.avgCpu1Mhz)
+        assertEquals(44.25, stats.avgCpuTempC!!, 0.01)
+
+        val rec3 = QptPowerParser.buildSavedRecord(3, stats, 1700000000123L)!!
+        val serialized = QptPowerParser.serializeRecords(mapOf(3 to rec3))
+        assertEquals(12, serialized.trim().split(',').size)
+
+        val restored = QptPowerParser.deserializeRecords(serialized)
+        assertEquals(1900, restored[3]!!.avgCpu0Mhz)
+        assertEquals(2600, restored[3]!!.avgCpu1Mhz)
+        assertEquals(44.3, restored[3]!!.avgCpuTempC!!, 0.01)
+
+        val legacyNineCol = "1,3,3,500,700,1200,200,0,1700000000000\n"
+        val legacyRestored = QptPowerParser.deserializeRecords(legacyNineCol)
+        assertEquals(1, legacyRestored.size)
+        assertEquals(1200, legacyRestored[1]!!.avgCpuTotalMw)
+        assertEquals(0, legacyRestored[1]!!.avgCpu0Mhz)
+        assertEquals(0, legacyRestored[1]!!.avgCpu1Mhz)
+        assertNull(legacyRestored[1]!!.avgCpuTempC)
     }
 }

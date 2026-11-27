@@ -510,6 +510,8 @@ object CompatibilityChecker {
                     ),
             )
             appendLine("QPT 硬件功耗轨: ${probe.qptRails.joinToString(", ").ifEmpty { "none" }}")
+            appendLine("启动原因 (boot_reason): ${probe.bootReason ?: "none"}")
+            appendLine("内核崩溃记录 (pstore): ${probe.pstoreCrash ?: "none"}")
         }
         val sets = snapshot.pdpCdb?.sets.orEmpty()
         if (sets.isNotEmpty()) {

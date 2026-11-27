@@ -24,6 +24,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -32,7 +34,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -44,6 +50,7 @@ import androidx.compose.ui.unit.dp
 import io.voltset.sm8850.R
 import io.voltset.sm8850.VoltSetUiState
 import io.voltset.sm8850.core.AdjustMode
+import io.voltset.sm8850.core.AutoRestoreSnapshot
 import io.voltset.sm8850.core.BaselineSource
 import io.voltset.sm8850.core.CdtState
 import io.voltset.sm8850.core.CdtStatus
@@ -67,6 +74,7 @@ internal fun SetsScreen(
     onResetDefault: () -> Unit,
     onReboot: () -> Unit,
     onToggleExpanded: (Int) -> Unit,
+    onUpdateAutoRestore: (Boolean, Int?) -> Unit,
     onOpenCompatTab: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -101,6 +109,38 @@ internal fun SetsScreen(
                 report = snapshot.compatibility,
                 onClick = onOpenCompatTab,
             )
+        }
+
+        if (snapshot.systemProbe.isAbnormalBoot || snapshot.systemProbe.hasPstoreCrash) {
+            item(key = "boot_health_warn") {
+                val reason = snapshot.systemProbe.bootReason
+                val pstore = snapshot.systemProbe.pstoreCrash
+                val body = buildString {
+                    if (reason != null) append("上次启动原因：$reason")
+                    if (pstore != null) {
+                        if (isNotEmpty()) append('\n')
+                        append("崩溃残留日志：$pstore")
+                    }
+                    if (isNotEmpty()) append('\n')
+                    append("若刚切换较高降压档位，建议立即测试稳定性或暂退回 Set 1 / 温和档位。")
+                }
+                WarningBannerCard(
+                    title = "检测到异常重启或内核崩溃线索",
+                    body = body,
+                )
+            }
+        }
+
+        val autoRestore = state.autoRestore
+        if (autoRestore != null && (autoRestore.moduleInstalled || autoRestore.config.enabled)) {
+            item(key = "auto_restore") {
+                AutoRestoreCard(
+                    snapshot = snapshot,
+                    autoRestore = autoRestore,
+                    controlsEnabled = state.controlsEnabled,
+                    onUpdateAutoRestore = onUpdateAutoRestore,
+                )
+            }
         }
 
         if (snapshot.cdtStatus.key7Enabled || snapshot.cdtStatus.state == CdtState.CORRUPT) {
@@ -590,6 +630,182 @@ private fun WarningBannerCard(
                     style = MaterialTheme.typography.bodySmall,
                     color = semantic.onWarnContainer,
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AutoRestoreCard(
+    snapshot: DeviceSnapshot,
+    autoRestore: AutoRestoreSnapshot,
+    controlsEnabled: Boolean,
+    onUpdateAutoRestore: (Boolean, Int?) -> Unit,
+) {
+    val semantic = LocalVoltSetColors.current
+    val sets = snapshot.pdpCdb?.sets.orEmpty().filter { it.setId in 2..7 }
+    val cfg = autoRestore.config
+    val defaultTarget = cfg.targetSet
+        ?: snapshot.sdamCpussIndex?.takeIf { it in 2..7 }
+        ?: snapshot.bootCpussIndex?.takeIf { it in 2..7 }
+        ?: sets.lastOrNull()?.setId
+        ?: 2
+    var selectedTarget by remember(cfg.targetSet, sets) { mutableIntStateOf(defaultTarget) }
+    var menuExpanded by remember { mutableStateOf(false) }
+
+    val blockReason = when {
+        !snapshot.canWriteOverrides -> "缺少 SDAM 写入权限或接口"
+        snapshot.overrideLockedByFirmware -> "pdp_cdb 固件已强制锁档"
+        snapshot.cdtStatus.key7Enabled -> "检测到 CDT Key 7 开启（叠加降压危险）"
+        snapshot.cdtStatus.state != CdtState.EMPTY && snapshot.cdtStatus.state != CdtState.STOCK ->
+            "无法确认 CDT Key 7 已关闭"
+        snapshot.pdpCdbSha256 == null -> "缺少 pdp_cdb 指纹"
+        snapshot.compatibility.level == CompatibilityLevel.UNSUPPORTED -> "当前设备兼容性检测未通过"
+        sets.isEmpty() -> "未检测到 Set 2..7 档位"
+        else -> null
+    }
+    val needsReview = cfg.enabled &&
+        (cfg.pdpCdbSha256 == null || cfg.pdpCdbSha256 != snapshot.pdpCdbSha256)
+
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, semantic.subtleBorder),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = "每次开机自动写入 Set（KSU 模块）",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = "针对断电或部分机型重置 SDAM2 导致的掉档（共用模块配置）",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+                val (chipLabel, chipBg, chipFg) = when {
+                    cfg.enabled && needsReview -> Triple(
+                        "待确认 · Set ${cfg.targetSet ?: selectedTarget}",
+                        semantic.warnContainer,
+                        semantic.onWarnContainer,
+                    )
+                    cfg.enabled -> Triple(
+                        "已开启 · Set ${cfg.targetSet ?: selectedTarget}",
+                        semantic.goodContainer,
+                        semantic.onGoodContainer,
+                    )
+                    else -> Triple(
+                        "已关闭",
+                        MaterialTheme.colorScheme.surfaceVariant,
+                        MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                StatusMiniChip(chipLabel, chipBg, chipFg)
+            }
+
+            if (blockReason != null) {
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = semantic.warnContainer,
+                    contentColor = semantic.onWarnContainer,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        text = blockReason,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(10.dp),
+                    )
+                }
+            }
+            if (needsReview) {
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = semantic.warnContainer,
+                    contentColor = semantic.onWarnContainer,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        text = "pdp_cdb 指纹缺失或已变化。确认目标档位后，关闭再开启自动写入。",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(10.dp),
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box {
+                    OutlinedButton(
+                        onClick = { menuExpanded = true },
+                        enabled = controlsEnabled && blockReason == null && !needsReview && sets.isNotEmpty(),
+                    ) {
+                        Text("目标 Set $selectedTarget")
+                    }
+                    DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                        for (profile in sets) {
+                            DropdownMenuItem(
+                                text = { Text("Set ${profile.setId}") },
+                                onClick = {
+                                    menuExpanded = false
+                                    selectedTarget = profile.setId
+                                    if (cfg.enabled) {
+                                        onUpdateAutoRestore(true, profile.setId)
+                                    }
+                                },
+                            )
+                        }
+                    }
+                }
+                if (cfg.enabled) {
+                    OutlinedButton(
+                        onClick = { onUpdateAutoRestore(false, selectedTarget) },
+                        enabled = controlsEnabled,
+                    ) {
+                        Text("关闭开机自动写")
+                    }
+                } else {
+                    Button(
+                        onClick = { onUpdateAutoRestore(true, selectedTarget) },
+                        enabled = controlsEnabled && blockReason == null,
+                    ) {
+                        Text("开启开机自动写")
+                    }
+                }
+            }
+
+            autoRestore.status?.detail?.let { detail ->
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Text(
+                            text = "上次开机执行（${autoRestore.status.time ?: "--"}）",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(text = detail, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
             }
         }
     }

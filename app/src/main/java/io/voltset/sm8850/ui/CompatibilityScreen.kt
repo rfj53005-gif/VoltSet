@@ -60,6 +60,7 @@ internal fun CompatibilityScreen(
     state: VoltSetUiState,
     snapshot: DeviceSnapshot,
     onRefresh: () -> Unit,
+    onExportDiagnosticZip: () -> Unit,
     onShowMessage: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -77,6 +78,7 @@ internal fun CompatibilityScreen(
                 snapshot = snapshot,
                 busy = state.busy,
                 onRefresh = onRefresh,
+                onExportDiagnosticZip = onExportDiagnosticZip,
                 onCopyReport = {
                     val appVersion = runCatching {
                         context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "未知"
@@ -172,6 +174,7 @@ private fun VerdictHeroCard(
     snapshot: DeviceSnapshot,
     busy: Boolean,
     onRefresh: () -> Unit,
+    onExportDiagnosticZip: () -> Unit,
     onCopyReport: () -> Unit,
 ) {
     val semantic = LocalVoltSetColors.current
@@ -286,6 +289,14 @@ private fun VerdictHeroCard(
                 ) {
                     Text("复制检测报告")
                 }
+            }
+
+            OutlinedButton(
+                onClick = onExportDiagnosticZip,
+                enabled = !busy,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("导出完整诊断压缩包 (ZIP)")
             }
         }
     }
@@ -511,6 +522,14 @@ private fun SystemProbeCard(snapshot: DeviceSnapshot) {
                     ProbeInfoRow(
                         label = "QPT 硬件功耗轨 (powercap)",
                         value = probe.qptRails.joinToString(", ").ifEmpty { "未发现" },
+                    )
+                    ProbeInfoRow(
+                        label = "启动原因 (boot_reason)",
+                        value = probe.bootReason ?: "未读取",
+                    )
+                    ProbeInfoRow(
+                        label = "内核崩溃日志 (pstore)",
+                        value = probe.pstoreCrash ?: "无异常记录",
                     )
                     Text(
                         text = "提示：点击顶部「复制检测报告」可一并导出以上全部只读探测路径，便于排查跨机型适配问题。",

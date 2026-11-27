@@ -34,22 +34,86 @@ fi
 
 if [ "${2:-}" = "power_sample" ]; then
     [ "$(id -u)" = 0 ] || { printf 'ERROR 需要 Root 权限\n' >&2; exit 1; }
+    # Every 1s poll used to fork ~15 `cat`/subshell children, which itself perturbs
+    # the idle CPU power it is trying to measure. Use `read` (shell builtin) instead.
     for d in /sys/class/powercap/qpt:0:[0-9]*; do
         [ -r "$d/name" ] && [ -r "$d/energy_uj" ] || continue
-        rname=$(cat "$d/name" 2>/dev/null || true)
-        renergy=$(cat "$d/energy_uj" 2>/dev/null || true)
-        [ -n "$rname" ] && [ -n "$renergy" ] && printf 'QPT_RAIL=%s:%s\n' "$rname" "$renergy"
+        rname=
+        renergy=
+        read -r rname < "$d/name" 2>/dev/null || rname=
+        read -r renergy < "$d/energy_uj" 2>/dev/null || renergy=
+        if [ -z "$rname" ] || [ -z "$renergy" ]; then
+            continue
+        fi
+        printf 'QPT_RAIL=%s:%s\n' "$rname" "$renergy"
         if [ -r "$d/power_uw" ]; then
-            rpower=$(cat "$d/power_uw" 2>/dev/null || true)
-            [ -n "$rname" ] && [ -n "$rpower" ] && printf 'QPT_POWER_UW=%s:%s\n' "$rname" "$rpower"
+            rpower=
+            read -r rpower < "$d/power_uw" 2>/dev/null || rpower=
+            if [ -n "$rpower" ]; then
+                printf 'QPT_POWER_UW=%s:%s\n' "$rname" "$rpower"
+            fi
         fi
     done
-    p0=$(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq 2>/dev/null || true)
-    p6=$(cat /sys/devices/system/cpu/cpufreq/policy6/scaling_cur_freq 2>/dev/null || true)
-    gpu=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null || true)
+    # Pick the two highest-max-frequency cpufreq policies instead of hardcoding
+    # policy0/policy6, so other cluster topologies still report mid/large cores.
+    large_pol=
+    mid_pol=
+    large_max=-1
+    mid_max=-1
+    for d in /sys/devices/system/cpu/cpufreq/policy[0-9]*; do
+        [ -r "$d/scaling_cur_freq" ] || continue
+        pmax=
+        read -r pmax 2>/dev/null < "$d/cpuinfo_max_freq" || pmax=
+        case "$pmax" in
+            ''|0|*[!0-9]*) read -r pmax 2>/dev/null < "$d/scaling_max_freq" || pmax= ;;
+        esac
+        case "$pmax" in ''|0|*[!0-9]*) continue ;; esac
+        if [ "$pmax" -gt "$large_max" ]; then
+            mid_pol=$large_pol
+            mid_max=$large_max
+            large_pol=$d
+            large_max=$pmax
+        elif [ "$pmax" -gt "$mid_max" ]; then
+            mid_pol=$d
+            mid_max=$pmax
+        fi
+    done
+    p0=
+    p1=
+    if [ -n "$mid_pol" ]; then
+        read -r p0 < "$mid_pol/scaling_cur_freq" 2>/dev/null || p0=
+    fi
+    if [ -n "$large_pol" ]; then
+        read -r p1 < "$large_pol/scaling_cur_freq" 2>/dev/null || p1=
+    fi
+    gpu=
+    read -r gpu < /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null || gpu=
     printf 'FREQ_CPU0_KHZ=%s\n' "${p0:-0}"
-    printf 'FREQ_CPU1_KHZ=%s\n' "${p6:-0}"
+    printf 'FREQ_CPU1_KHZ=%s\n' "${p1:-0}"
     printf 'FREQ_GPU_HZ=%s\n' "${gpu:-0}"
+    max_temp=0
+    soc_temp=0
+    for tz in /sys/class/thermal/thermal_zone[0-9]*; do
+        [ -r "$tz/type" ] && [ -r "$tz/temp" ] || continue
+        ztype=
+        ztemp=
+        read -r ztype < "$tz/type" 2>/dev/null || ztype=
+        read -r ztemp < "$tz/temp" 2>/dev/null || ztemp=
+        case "$ztemp" in ''|*[!0-9]*) continue ;; esac
+        [ "$ztemp" -ge 1000 ] && [ "$ztemp" -le 130000 ] || continue
+        case "$ztype" in
+            [cC][pP][uU]*)
+                [ "$ztemp" -le "$max_temp" ] || max_temp=$ztemp
+                ;;
+            [sS][oO][cC][dD]*|[nN][sS][pP][sS][sS]*)
+                [ "$ztemp" -le "$soc_temp" ] || soc_temp=$ztemp
+                ;;
+        esac
+    done
+    [ "$max_temp" -gt 0 ] || max_temp=$soc_temp
+    if [ "$max_temp" -gt 0 ]; then
+        printf 'TEMP_CPU_MC=%s\n' "$max_temp"
+    fi
     exit 0
 fi
 
@@ -66,51 +130,19 @@ existing_debugfs_has_adj() {
     return 1
 }
 
-if [ -z "${VOLTSET_PRIVATE_NS:-}" ] && [ "$(id -u)" = 0 ] && ! existing_debugfs_has_adj; then
-    helper_src="${1:-}/bin/vsetns"
-    if [ -n "${1:-}" ] && [ -r "$helper_src" ]; then
-        mkdir -p /data/adb/voltset 2>/dev/null || true
-        chmod 700 /data/adb/voltset 2>/dev/null || true
-        helper_bin=/data/adb/voltset/vsetns
-        if [ ! -x "$helper_bin" ] || ! cmp -s "$helper_src" "$helper_bin" 2>/dev/null; then
-            helper_tmp="$helper_bin.tmp.$$"
-            if cp "$helper_src" "$helper_tmp" 2>/dev/null &&
-                chmod 700 "$helper_tmp" 2>/dev/null &&
-                mv -f "$helper_tmp" "$helper_bin" 2>/dev/null; then
-                :
-            else
-                rm -f -- "$helper_tmp" 2>/dev/null || true
-            fi
-        fi
-        if [ -x "$helper_bin" ]; then
-            VOLTSET_PRIVATE_NS=1
-            export VOLTSET_PRIVATE_NS
-            exec "$helper_bin" /system/bin/sh "$0" "$@"
-        fi
-    fi
-fi
-
-transient_debugfs=0
-if [ -z "${VOLTSET_PRIVATE_NS:-}" ] && [ "$(id -u)" = 0 ] && ! existing_debugfs_has_adj; then
-    if mount -t debugfs -o nosuid,nodev,noexec debugfs /sys/kernel/debug 2>/dev/null; then
-        transient_debugfs=1
-    fi
-fi
-
-bundle=$1
-action=$2
-shift 2
-
 root=/data/adb/voltset
 persistent=$root/persistent
 session=$root/session
 last_set=$persistent/last-set
+auto_conf=$persistent/auto-restore.conf
+auto_status=$persistent/auto-restore.status
 suntuner_baseline=/data/adb/sm8750-tuner/persistent/stock-baseline.csv
 modules=/sys/module
 boot_file=/proc/sys/kernel/random/boot_id
 
 work=
 owned_scmi=
+transient_debugfs=0
 
 die() {
     printf 'ERROR %s\n' "$*" >&2
@@ -128,7 +160,7 @@ unload_scmi() {
 cleanup() {
     rc=$?
     trap - EXIT
-    if [ "${transient_debugfs:-0}" = 1 ]; then
+    if [ "$transient_debugfs" = 1 ]; then
         umount /sys/kernel/debug 2>/dev/null || rc=1
     fi
     unload_scmi || {
@@ -137,6 +169,24 @@ cleanup() {
     }
     [ -z "$work" ] || rm -rf -- "$work" || rc=1
     exit "$rc"
+}
+
+trap cleanup EXIT
+trap 'exit 143' TERM HUP INT
+trap '' PIPE
+
+install_native_helper() {
+    local name=$1
+    local src="$bundle/bin/$name" dst="$root/$name" tmp="$root/$name.tmp.$$"
+    [ -r "$src" ] || return 1
+    mkdir -p "$root" && chmod 700 "$root" || return 1
+    if [ ! -x "$dst" ] || ! cmp -s "$src" "$dst"; then
+        if ! { cp "$src" "$tmp" && chmod 700 "$tmp" && mv -f "$tmp" "$dst"; }; then
+            rm -f -- "$tmp"
+            return 1
+        fi
+    fi
+    printf '%s\n' "$dst"
 }
 
 is_sm8850() {
@@ -581,6 +631,58 @@ verify_overrides() {
     [ "$cpuss_idx:$global_idx" = "$2:$3" ] || die "SDAM 档位已变化，请刷新后重新确认"
 }
 
+probe_adjustment() {
+    adj_backend=none
+    adj_available=0
+    adj_set_node=0
+    adj_error=
+    if find_adj_pair; then
+        adj_backend=debugfs
+        [ ! -e "$adj_dir/set_overrides" ] || adj_set_node=1
+        if read_overrides_indices "$adj_dir/get_overrides"; then
+            adj_available=1
+        else
+            adj_error="无法解析 get_overrides 输出"
+        fi
+    else
+        dbg=$(first_debugfs_mount 2>/dev/null || true)
+        if [ "${1:-}" = quick ]; then
+            discover_vadj_platform
+            discover_sdam2_nvmem
+        fi
+        if [ -n "$sdam_nvmem_path" ] && [ -r "$sdam_nvmem_path" ]; then
+            if read_sdam2_nvmem_overrides "$sdam_nvmem_path"; then
+                adj_backend=nvmem
+                adj_available=1
+                [ ! -w "$sdam_nvmem_path" ] || adj_set_node=1
+            else
+                adj_error="未找到 debugfs/qcom_voltage_adj；虽检测到 $sdam_nvmem_path (0x7151=0x${sdam_hex:-??})，但读回未通过安全校验，为安全起见未启用 nvmem 兜底"
+            fi
+        fi
+    fi
+    if [ "$adj_available" = 1 ] && [ ! -f "$session/boot-cpuss-idx" ]; then
+        printf '%s\n' "$cpuss_idx" > "$session/boot-cpuss-idx"
+    fi
+}
+
+emit_adjustment_status() {
+    local private_ns=0 path=$adj_dir
+    [ "${VOLTSET_PRIVATE_NS:-0}" != 1 ] || private_ns=1
+    [ "$adj_backend" != nvmem ] || path=$sdam_nvmem_path
+    printf 'ADJ_BACKEND=%s\n' "$adj_backend"
+    printf 'DEBUGFS=%s\n' "${dbg:-none}"
+    printf 'DEBUGFS_PRIVATE_NS=%s\n' "$private_ns"
+    printf 'ADJ_DIR=%s\n' "${path:-none}"
+    printf 'ADJ_SET_NODE=%s\n' "$adj_set_node"
+    printf 'ADJ_AVAILABLE=%s\n' "$adj_available"
+    if [ "$adj_available" = 1 ]; then
+        printf 'SDAM_CPUSS_IDX=%s\n' "$cpuss_idx"
+        printf 'SDAM_GLOBAL_IDX=%s\n' "$global_idx"
+    elif [ -n "$adj_error" ]; then
+        printf 'ADJ_ERROR=%s\n' "$adj_error"
+    fi
+}
+
 find_partition_dev() {
     local target=$1 path blk
     for path in \
@@ -588,16 +690,15 @@ find_partition_dev() {
         "/dev/block/bootdevice/by-name/$target" \
         /dev/block/platform/*/by-name/"$target" \
         /dev/block/platform/*/*/by-name/"$target"; do
-        if [ -e "$path" ]; then
+        if [ -b "$path" ]; then
             printf '%s\n' "$path"
             return 0
         fi
     done
     blk=$(awk -F= -v t="$target" '
         FNR == 1 {
-            b = FILENAME
-            sub(/^\/sys\/class\/block\//, "", b)
-            sub(/\/uevent$/, "", b)
+            n = split(FILENAME, path, "/")
+            b = path[n - 1]
         }
         $1 == "PARTNAME" && $2 == t {
             print b
@@ -609,6 +710,55 @@ find_partition_dev() {
         return 0
     fi
     return 1
+}
+
+emit_gpu_corners() {
+    local mp db gfx
+    for mp in /sys/kernel/debug $(awk '$3 == "debugfs" { print $2 }' /proc/mounts); do
+        db="$mp/cmd-db"
+        [ -r "$db" ] || continue
+        gfx=$(awk '$2 == "gfx.lvl" { print "gfx=" $0 }' "$db" 2>/dev/null) || continue
+        [ -n "$gfx" ] || continue
+        printf '%s\n' "$gfx"
+        return 0
+    done
+    return 1
+}
+
+emit_gpu_info() {
+    local corners=${1:-0} slot source bytes file acd helper
+    [ "$#" -le 1 ] && { [ "$corners" = 0 ] || [ "$corners" = 1 ]; } || die "gpu_info 参数无效"
+    slot=$(getprop ro.boot.slot_suffix)
+    case "$slot" in _a|_b) ;; *) die "无法识别当前 A/B 启动槽位" ;; esac
+    source=$(find_partition_dev "vendor_boot$slot") || die "找不到当前槽位的 vendor_boot"
+    bytes=$(blockdev --getsize64 "$source") || die "无法读取 vendor_boot 分区大小"
+    printf 'slot=%s\nsource=%s\n' "$slot" "$source"
+    printf 'device=%s\n' "$(getprop ro.product.device)"
+    printf 'build=%s\n' "$(getprop ro.build.version.incremental)"
+    printf 'index=%s\n' "$(getprop ro.boot.dtb_idx)"
+    printf 'boot=%s\n' "$(cat "$boot_file")"
+    printf 'bytes=%s\n' "$bytes"
+    for file in /sys/class/kgsl/kgsl-3d0/gpu_available_frequencies /sys/class/kgsl/kgsl-3d0/devfreq/available_frequencies; do
+        if [ -r "$file" ]; then
+            printf 'frequencies=%s\n' "$(cat "$file")"
+            break
+        fi
+    done
+    if acd=$(cat /sys/class/kgsl/kgsl-3d0/acd 2>/dev/null); then
+        printf 'acd=%s\n' "$acd"
+    fi
+    if find_partition_dev "dtbo$slot" >/dev/null 2>&1 || find_partition_dev dtbo >/dev/null 2>&1; then
+        printf 'dtbo_present=1\n'
+    else
+        printf 'dtbo_present=0\n'
+    fi
+    if [ "$corners" = 1 ]; then
+        printf 'soc_model=%s\n' "$(getprop ro.soc.model 2>/dev/null || true)"
+        printf 'soc_id=%s\n' "$(cat /sys/devices/soc0/soc_id 2>/dev/null || getprop ro.vendor.qti.soc_id 2>/dev/null || true)"
+        if ! emit_gpu_corners && helper=$(install_native_helper vsetns 2>/dev/null); then
+            "$helper" /system/bin/sh "$0" "$bundle" gpu_corners 2>/dev/null || true
+        fi
+    fi
 }
 
 find_pdp_cdb() {
@@ -629,31 +779,53 @@ find_pdp_fw() {
     find_partition_dev pdp
 }
 
+read_partition_prefix() {
+    # dd stops at EOF on smaller partitions. Both frontends accept up to 4 MiB.
+    dd if="$1" of="$2" bs=4096 count=1024 2>/dev/null && [ -s "$2" ]
+}
+
+partition_fingerprint() {
+    local raw_file=$1 hash
+    hash=$(sha256sum "$raw_file" 2>/dev/null) || return 1
+    hash=${hash%% *}
+    valid_fingerprint "$hash" || return 1
+    printf '%s\n' "$hash"
+}
+
+valid_fingerprint() {
+    [ "${#1}" = 64 ] || return 1
+    case "$1" in *[!0-9a-f]*) return 1 ;; esac
+}
+
+read_pdp_cdb_fingerprint() {
+    local dev raw_file="$work/pdp-cdb.raw"
+    dev=$(find_pdp_cdb) && read_partition_prefix "$dev" "$raw_file" || return 1
+    partition_fingerprint "$raw_file"
+}
+
 emit_partition_block() {
-    local dev=$1 blocks=$2 gz_tag=$3 raw_tag=$4 err_key=$5 err_msg=$6
-    local raw_file="$work/$raw_tag.raw"
-    local b64_file="$work/$raw_tag.b64"
-    if ! dd if="$dev" bs=4096 count="$blocks" of="$raw_file" 2>/dev/null || [ ! -s "$raw_file" ]; then
-        rm -f -- "$raw_file"
+    local dev=$1 gz_tag=$2 raw_tag=$3 err_key=$4 err_msg=$5 hash
+    local raw_file="$work/partition.raw" gz_file="$work/partition.gz" b64_file="$work/partition.b64"
+    local tag=$gz_tag
+    if ! read_partition_prefix "$dev" "$raw_file"; then
         printf '%s=%s\n' "$err_key" "$err_msg"
-        return 0
+        return
     fi
-    if command -v gzip >/dev/null 2>&1 &&
-        gzip -c "$raw_file" > "$raw_file.gz" 2>/dev/null &&
-        [ -s "$raw_file.gz" ] &&
-        base64 < "$raw_file.gz" | tr -d '\n' > "$b64_file" &&
-        [ -s "$b64_file" ]; then
-        printf '%s_BEGIN\n' "$gz_tag"
-        cat "$b64_file"
-        printf '\n%s_END\n' "$gz_tag"
-    elif base64 < "$raw_file" | tr -d '\n' > "$b64_file" && [ -s "$b64_file" ]; then
-        printf '%s_BEGIN\n' "$raw_tag"
-        cat "$b64_file"
-        printf '\n%s_END\n' "$raw_tag"
-    else
-        printf '%s=%s\n' "$err_key" "$err_msg"
+    if [ "$raw_tag" = "PDP_CDB_B64" ] && hash=$(partition_fingerprint "$raw_file"); then
+        printf 'PDP_CDB_SHA256=%s\n' "$hash"
     fi
-    rm -f -- "$raw_file" "$raw_file.gz" "$b64_file"
+    if ! { gzip -c "$raw_file" > "$gz_file" 2>/dev/null &&
+        base64 -w 0 "$gz_file" > "$b64_file" && [ -s "$b64_file" ]; }; then
+        tag=$raw_tag
+        if ! base64 -w 0 "$raw_file" > "$b64_file" || [ ! -s "$b64_file" ]; then
+            printf '%s=%s\n' "$err_key" "$err_msg"
+            return
+        fi
+    fi
+    printf '%s_BEGIN\n' "$tag"
+    cat "$b64_file"
+    printf '\n%s_END\n' "$tag"
+    rm -f -- "$raw_file" "$gz_file" "$b64_file"
 }
 
 find_cdt() {
@@ -663,6 +835,45 @@ find_cdt() {
         return 0
     fi
     find_partition_dev cdt
+}
+
+# Mirrors core/CdtInspector.kt for known formats. Ambiguous data blocks auto-restore.
+cdt_key7() {
+    local dev raw="$work/cdt.raw"
+    dev=$(find_cdt) && [ -r "$dev" ] || {
+        printf 'unavailable\n'
+        return 0
+    }
+    dd if="$dev" of="$raw" bs=1024 count=1 2>/dev/null &&
+        od -An -v -tu1 "$raw" > "$work/cdt-bytes" || {
+        printf 'unknown\n'
+        return 0
+    }
+    awk '
+        { for (i = 1; i <= NF; i++) { b[n++] = $i + 0; if ($i != 0) nonzero = 1 } }
+        END {
+            if (n < 18) { print "unknown"; exit }
+            if (!nonzero) { print "off"; exit }
+            if (b[0] != 67 || b[1] != 68 || b[2] != 84 || b[3] != 0) { print "unknown"; exit }
+            off = b[14] + 256 * b[15]
+            size = b[16] + 256 * b[17]
+            if (off < 18 || size < 6 || off + size > n) { print "unknown"; exit }
+            ver = b[off]
+            if (ver == 6 && size == 9) { print "off"; exit }
+            if (ver < 3 || ver > 6) { print "unknown"; exit }
+            hl = (ver == 3) ? 6 : ((ver >= 6) ? 10 : 7)
+            if (size < hl) { print "unknown"; exit }
+            cnt = b[off + hl - 1]
+            if (hl + cnt * 2 > size) { print "unknown"; exit }
+            for (i = 0; i < cnt; i++) {
+                if (b[off + hl + i * 2] == 7 && b[off + hl + i * 2 + 1] != 0) {
+                    print b[off + hl + i * 2 + 1]
+                    exit
+                }
+            }
+            print "off"
+        }
+    ' "$work/cdt-bytes" 2>/dev/null || printf 'unknown\n'
 }
 
 join_lines_csv() {
@@ -773,6 +984,25 @@ emit_system_probe() {
             esac
         done | join_lines_csv
     )
+    boot_reason=$(
+        {
+            getprop ro.boot.bootreason 2>/dev/null || true
+            getprop sys.boot.reason 2>/dev/null || true
+        } | awk 'NF && !seen[$0]++ { print }' | join_lines_csv
+    )
+    pstore_crash=none
+    for pf in /sys/fs/pstore/console-ramoops-0 /sys/fs/pstore/console-ramoops /sys/fs/pstore/dmesg-ramoops-0; do
+        [ -r "$pf" ] && [ -s "$pf" ] || continue
+        hit=$(grep -iE 'Kernel panic|Watchdog|BUG:|Oops|Internal error|Subsystem restart' "$pf" 2>/dev/null |
+            tail -n 1 | tr '\r\n\t' '   ' | tr -cd '[:print:]' |
+            awk '{ gsub(/^[ \t]+|[ \t]+$/, ""); print substr($0, 1, 120); exit }' || true)
+        if [ -n "$hit" ]; then
+            pstore_crash="$(basename "$pf"): $hit"
+        else
+            pstore_crash="$(basename "$pf") (present)"
+        fi
+        break
+    done
 
     printf 'PROBE_BEGIN\n'
     printf 'vadj_platform_dev=%s\n' "${vadj_platform_dev:-none}"
@@ -794,10 +1024,210 @@ emit_system_probe() {
     printf 'qpt_rails=%s\n' "$qpt_rails"
     printf 'sdam2_nvmem=%s\n' "${sdam_nvmem_path:-none}"
     printf 'sdam2_pmic=%s\n' "${sdam_nvmem_pmic:-none}"
+    printf 'boot_reason=%s\n' "${boot_reason:-none}"
+    printf 'pstore_crash=%s\n' "${pstore_crash:-none}"
     printf 'PROBE_END\n'
 }
 
+
+write_override() {
+    local target_cpuss=$1 expected_cpuss=$2 target_global=$3 dec
+    if [ -n "$adj_dir" ]; then
+        [ -e "$adj_dir/set_overrides" ] || die "缺少 qcom_voltage_adj/set_overrides 节点"
+        [ -r "$adj_dir/get_overrides" ] || die "缺少 qcom_voltage_adj/get_overrides 节点"
+
+        verify_overrides "$adj_dir/get_overrides" "$expected_cpuss" "$target_global"
+        if [ ! -f "$session/boot-cpuss-idx" ]; then
+            printf '%s\n' "$cpuss_idx" > "$session/boot-cpuss-idx"
+        fi
+        printf '%s %s\n' "$boot" "$target_cpuss" > "$work/last-set" || die "无法创建档位记录"
+
+        dec=$(( (target_cpuss << 4) | target_global ))
+        printf '%s\n' "$dec" > "$adj_dir/set_overrides" || die "写入 set_overrides 失败"
+
+        read_overrides_indices "$adj_dir/get_overrides" || die "写入后回读 get_overrides 失败"
+        [ "$cpuss_idx" = "$target_cpuss" ] && [ "$global_idx" = "$target_global" ] ||
+            die "写入校验失败：读回为 CPUSS=$cpuss_idx Global=$global_idx（期望 $target_cpuss/$target_global）"
+        mv "$work/last-set" "$last_set" || die "SDAM 已写入，但无法保存重启核对记录"
+
+        if [ "$action" = auto_restore ]; then
+            return 0
+        fi
+        read_reg_7151 "$dbg" "$vadj_spmi_parent"
+        printf 'SDAM_CPUSS_IDX=%s\n' "$cpuss_idx"
+        printf 'SDAM_GLOBAL_IDX=%s\n' "$global_idx"
+        printf 'REG_7151=%s\n' "$reg_7151"
+    elif [ -n "$sdam_nvmem_path" ] && [ -r "$sdam_nvmem_path" ] && [ -w "$sdam_nvmem_path" ]; then
+        read_sdam2_nvmem_overrides "$sdam_nvmem_path" || die "未找到 debugfs，且 $sdam_nvmem_path 当前 0x7151 状态未通过安全校验"
+        [ "$cpuss_idx:$global_idx" = "$expected_cpuss:$target_global" ] || die "SDAM 档位已变化，请刷新后重新确认"
+        if [ ! -f "$session/boot-cpuss-idx" ]; then
+            printf '%s\n' "$cpuss_idx" > "$session/boot-cpuss-idx"
+        fi
+        printf '%s %s\n' "$boot" "$target_cpuss" > "$work/last-set" || die "无法创建档位记录"
+
+        write_sdam2_nvmem_overrides "$sdam_nvmem_path" "$target_cpuss" "$target_global" || die "写入 $sdam_nvmem_path (0x7151) 失败"
+
+        read_sdam2_nvmem_overrides "$sdam_nvmem_path" || die "写入后回读 $sdam_nvmem_path 失败"
+        [ "$cpuss_idx" = "$target_cpuss" ] && [ "$global_idx" = "$target_global" ] ||
+            die "写入校验失败：读回为 CPUSS=$cpuss_idx Global=$global_idx（期望 $target_cpuss/$target_global）"
+        mv "$work/last-set" "$last_set" || die "SDAM 已写入，但无法保存重启核对记录"
+
+        printf 'SDAM_CPUSS_IDX=%s\n' "$cpuss_idx"
+        printf 'SDAM_GLOBAL_IDX=%s\n' "$global_idx"
+        printf 'REG_7151=%s\n' "$sdam_hex"
+    else
+        die "未找到 debugfs/qcom_voltage_adj 或可用的 spmi_sdam2/nvmem 接口"
+    fi
+}
+
+write_auto_restore_config() {
+    local enabled=$1 target=$2 hash=$3 tmp="$work/auto-restore.conf"
+    {
+        printf 'enabled=%s\ntarget_set=%s\n' "$enabled" "$target"
+        if [ -n "$hash" ]; then
+            printf 'pdp_cdb_sha256=%s\n' "$hash"
+        fi
+    } > "$tmp" && mv -f "$tmp" "$auto_conf"
+}
+
+set_auto_restore() {
+    local enabled=$1 target=$2 hash current
+    case "$enabled:$target" in
+        0:|0:[2-7]) write_auto_restore_config 0 "$target" "" || die "保存开机自动写入配置失败" ;;
+        1:[2-7])
+            [ "$#" = 4 ] && [ "$3" = "$boot" ] || die "启动状态已变化，请刷新后重试"
+            hash=$4
+            valid_fingerprint "$hash" || die "缺少有效的 pdp_cdb 指纹，请刷新后重试"
+            [ "$(cdt_key7)" = off ] || die "无法确认 CDT Key 7 已关闭"
+            current=$(read_pdp_cdb_fingerprint) || die "读取 pdp_cdb 指纹失败"
+            [ "$current" = "$hash" ] || die "pdp_cdb 已变化，请刷新并重新确认档位"
+            write_auto_restore_config 1 "$target" "$hash" || die "保存开机自动写入配置失败"
+            ;;
+        *) die "开机自动写入配置无效" ;;
+    esac
+}
+
+write_auto_restore_status() {
+    local result=$1 observed=$2 detail=$3 tmp="$work/auto-restore.status"
+    if [ "$dry_run" = 1 ]; then
+        printf 'DRY_RUN action=%s target=%s observed=%s detail=%s\n' "$result" "$target_set" "$observed" "$detail"
+        return 0
+    fi
+    {
+        printf 'boot_id=%s\ntime=%s\n' "$boot" "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf 'action=%s\ntarget_set=%s\nobserved_set=%s\ndetail=%s\n' "$result" "$target_set" "$observed" "$detail"
+    } > "$tmp" && mv -f "$tmp" "$auto_status"
+}
+
+restore_on_boot() {
+    local dry_run=0 enabled=0 target_set= saved_hash= k v reason key7 current err
+    [ "${1:-}" != "--dry-run" ] || dry_run=1
+    [ -r "$auto_conf" ] || return 0
+    while IFS='=' read -r k v || [ -n "$k$v" ]; do
+        case "$k" in
+            enabled) enabled=$v ;;
+            target_set) target_set=$v ;;
+            pdp_cdb_sha256) saved_hash=$v ;;
+        esac
+    done < "$auto_conf"
+    [ "$enabled" = 1 ] || return 0
+    case "$target_set" in [2-7]) ;; *) return 0 ;; esac
+    if [ "$dry_run" = 0 ] && [ -r "$auto_status" ] && grep -qx "boot_id=$boot" "$auto_status"; then
+        return 0
+    fi
+
+    reason=$(
+        { getprop ro.boot.bootreason; getprop sys.boot.reason; } 2>/dev/null |
+            tr '\n[:upper:]' ' [:lower:]'
+    )
+    case "$reason" in
+        *watchdog*|*wdog*|*wdt*|*panic*|*crash*|*lockup*|*fatal*)
+            if [ "$dry_run" = 0 ] && ! write_auto_restore_config 0 "$target_set" ""; then
+                write_auto_restore_status skipped_bootreason "" "检测到异常重启（$reason），本次已跳过，关闭自动写入配置失败"
+            else
+                write_auto_restore_status skipped_bootreason "" "检测到异常重启（$reason），自动写入暂停，需在 WebUI 重新开启"
+            fi
+            return
+            ;;
+    esac
+    if ! valid_fingerprint "$saved_hash"; then
+        write_auto_restore_status skipped_firmware "" "缺少 pdp_cdb 指纹，请在 WebUI 关闭后重新开启自动写入"
+        return
+    fi
+    key7=$(cdt_key7)
+    case "$key7" in
+        off) ;;
+        unavailable|unknown)
+            write_auto_restore_status skipped_cdt "" "无法确认 CDT Key 7 已关闭，已跳过自动写入"
+            return
+            ;;
+        *)
+            write_auto_restore_status skipped_cdt "" "CDT Key 7=$key7 已开启，已跳过自动写入"
+            return
+            ;;
+    esac
+    current=$(read_pdp_cdb_fingerprint) || current=
+    if [ "$current" != "$saved_hash" ]; then
+        write_auto_restore_status skipped_firmware "" "pdp_cdb 已变化或无法读取，请刷新设备状态并重新确认自动写入"
+        return
+    fi
+    probe_adjustment quick
+    if [ "$adj_available:$adj_set_node" != 1:1 ]; then
+        write_auto_restore_status skipped_unavailable "" "调压写入接口不可用，已跳过自动写入"
+        return
+    fi
+    if [ "$cpuss_idx" = "$target_set" ]; then
+        write_auto_restore_status skipped_already_target "$cpuss_idx" "SDAM 已是 Set $target_set，无需重复写入"
+    elif [ "$dry_run" = 1 ]; then
+        write_auto_restore_status dry_run_would_write "$cpuss_idx" "当前为 Set $cpuss_idx，正常开机会写入 Set $target_set"
+    elif err=$(write_override "$target_set" "$cpuss_idx" "$global_idx" 2>&1); then
+        write_auto_restore_status written "$cpuss_idx" "开机检测原值为 Set $cpuss_idx，已写入并回读确认 Set $target_set（下次重启生效）"
+    else
+        err=$(printf '%s' "$err" | tr '\n' ' ')
+        write_auto_restore_status error "$cpuss_idx" "开机自动写入 Set $target_set 失败：$err"
+    fi
+}
+
 [ "$(id -u)" = 0 ] || die "需要 Root 权限"
+[ "$#" -ge 2 ] || die "缺少后端操作参数"
+bundle=$1
+action=$2
+shift 2
+
+needs_debugfs=0
+case "$action" in
+    gpu_info) emit_gpu_info "$@"; exit ;;
+    gpu_corners) emit_gpu_corners; exit ;;
+    power_stream)
+        [ "$#" -le 1 ] || die "power_stream 参数无效"
+        helper=$(install_native_helper vsetqpt) || die "无法部署 QPT 采样程序"
+        exec "$helper" "$root/qpt.lock" "$@"
+        ;;
+    status|quick_status|set_override|save_baseline|reboot) needs_debugfs=1 ;;
+    set_auto_restore)
+        case "$#:${1:-}" in 2:0|4:1) ;; *) die "set_auto_restore 参数无效" ;; esac
+        ;;
+    read_power_records|read_auto_restore)
+        [ "$#" = 0 ] || die "$action 参数无效"
+        ;;
+    write_power_records)
+        [ "$#" = 1 ] || die "write_power_records 参数无效"
+        ;;
+    auto_restore)
+        case "$#:${1:-}" in 0:|1:--dry-run) ;; *) die "auto_restore 参数无效" ;; esac
+        [ -r "$auto_conf" ] && grep -qx 'enabled=1' "$auto_conf" || exit 0
+        needs_debugfs=1
+        ;;
+    *) die "未知操作: $action" ;;
+esac
+
+if [ "$needs_debugfs" = 1 ] && [ "${VOLTSET_PRIVATE_NS:-0}" != 1 ] &&
+    ! existing_debugfs_has_adj && helper=$(install_native_helper vsetns 2>/dev/null); then
+    VOLTSET_PRIVATE_NS=1
+    export VOLTSET_PRIVATE_NS
+    exec "$helper" /system/bin/sh "$0" "$bundle" "$action" "$@"
+fi
+
 boot=$(cat "$boot_file" 2>/dev/null || true)
 case "$boot" in
     ????????-????-????-????-????????????) ;;
@@ -807,7 +1237,17 @@ esac
 mkdir -p "$root" "$persistent"
 chmod 700 "$root" "$persistent"
 exec 9>"$root/lock"
-flock -n 9 9>&9 || die "另一项 Root 操作正在进行，请稍后重试"
+if [ "$action" = auto_restore ]; then
+    flock 9 9>&9 || die "开机自动写入无法获取 Root 锁"
+else
+    flock -n 9 9>&9 || die "另一项 Root 操作正在进行，请稍后重试"
+fi
+
+# A shared mount, if needed, is owned by this locked operation and covered by cleanup.
+if [ "$needs_debugfs" = 1 ] && [ "${VOLTSET_PRIVATE_NS:-0}" != 1 ] && ! first_debugfs_mount >/dev/null &&
+    mount -t debugfs -o nosuid,nodev,noexec debugfs /sys/kernel/debug 2>/dev/null; then
+    transient_debugfs=1
+fi
 
 last_set_boot=
 last_set_idx=
@@ -829,9 +1269,6 @@ if [ "$(cat "$session/boot" 2>/dev/null || true)" != "$boot" ]; then
 fi
 
 work=$(mktemp -d "$root/work.XXXXXXXX")
-trap cleanup EXIT
-trap 'exit 143' TERM HUP INT
-trap '' PIPE
 
 case "$action" in
     status)
@@ -873,82 +1310,19 @@ case "$action" in
             done | sort -u | head -n 8 | awk 'NF { printf "%s%s", (c++ ? "," : ""), $0 }'
         )
 
-        if find_adj_pair; then
-            printf 'ADJ_BACKEND=debugfs\n'
-            printf 'DEBUGFS=%s\n' "$dbg"
-            printf 'ADJ_DIR=%s\n' "$adj_dir"
-            if [ "${VOLTSET_PRIVATE_NS:-0}" = 1 ]; then
-                printf 'DEBUGFS_PRIVATE_NS=1\n'
-            else
-                printf 'DEBUGFS_PRIVATE_NS=0\n'
-            fi
-            if [ -e "$adj_dir/set_overrides" ]; then
-                printf 'ADJ_SET_NODE=1\n'
-            else
-                printf 'ADJ_SET_NODE=0\n'
-            fi
-            if read_overrides_indices "$adj_dir/get_overrides"; then
-                printf 'ADJ_AVAILABLE=1\n'
-                if [ ! -f "$session/boot-cpuss-idx" ]; then
-                    printf '%s\n' "$cpuss_idx" > "$session/boot-cpuss-idx"
-                fi
-                printf 'SDAM_CPUSS_IDX=%s\n' "$cpuss_idx"
-                printf 'SDAM_GLOBAL_IDX=%s\n' "$global_idx"
-            else
-                printf 'ADJ_AVAILABLE=0\n'
-                printf 'ADJ_ERROR=无法解析 get_overrides 输出\n'
-            fi
-        elif [ -n "$sdam_nvmem_path" ] && [ -r "$sdam_nvmem_path" ]; then
-            dbg=$(first_debugfs_mount 2>/dev/null || true)
-            printf 'DEBUGFS=%s\n' "${dbg:-none}"
-            if [ "${VOLTSET_PRIVATE_NS:-0}" = 1 ] && [ -n "$dbg" ]; then
-                printf 'DEBUGFS_PRIVATE_NS=1\n'
-            else
-                printf 'DEBUGFS_PRIVATE_NS=0\n'
-            fi
-            if read_sdam2_nvmem_overrides "$sdam_nvmem_path"; then
-                printf 'ADJ_BACKEND=nvmem\n'
-                printf 'ADJ_DIR=%s\n' "$sdam_nvmem_path"
-                if [ -w "$sdam_nvmem_path" ]; then
-                    printf 'ADJ_SET_NODE=1\n'
-                else
-                    printf 'ADJ_SET_NODE=0\n'
-                fi
-                printf 'ADJ_AVAILABLE=1\n'
-                if [ ! -f "$session/boot-cpuss-idx" ]; then
-                    printf '%s\n' "$cpuss_idx" > "$session/boot-cpuss-idx"
-                fi
-                printf 'SDAM_CPUSS_IDX=%s\n' "$cpuss_idx"
-                printf 'SDAM_GLOBAL_IDX=%s\n' "$global_idx"
-            else
-                printf 'ADJ_BACKEND=none\n'
-                printf 'ADJ_DIR=none\n'
-                printf 'ADJ_SET_NODE=0\n'
-                printf 'ADJ_AVAILABLE=0\n'
-                printf 'ADJ_ERROR=未找到 debugfs/qcom_voltage_adj；虽检测到 %s (0x7151=0x%s)，但有效位 0x88 未置位，为安全起见未启用 nvmem 兜底\n' "$sdam_nvmem_path" "${sdam_hex:-??}"
-            fi
-        else
-            dbg=$(first_debugfs_mount 2>/dev/null || true)
-            printf 'ADJ_BACKEND=none\n'
-            printf 'DEBUGFS=%s\n' "${dbg:-none}"
-            printf 'ADJ_DIR=none\n'
-            if [ "${VOLTSET_PRIVATE_NS:-0}" = 1 ]; then
-                printf 'DEBUGFS_PRIVATE_NS=1\n'
-            else
-                printf 'DEBUGFS_PRIVATE_NS=0\n'
-            fi
-            printf 'ADJ_SET_NODE=0\n'
-            printf 'ADJ_AVAILABLE=0\n'
+        probe_adjustment
+        if [ "$adj_available" = 0 ] && [ -z "$adj_error" ]; then
             if [ "$vadj_mod_loaded" = 1 ]; then
-                printf 'ADJ_ERROR=内核已加载 qcom_voltage_adj 驱动，但无法挂载或访问 debugfs 节点（请检查内核 CONFIG_DEBUG_FS 或 SELinux 限制）\n'
+                adj_error="内核已加载 qcom_voltage_adj 驱动，但无法挂载或访问 debugfs 节点（请检查内核 CONFIG_DEBUG_FS 或 SELinux 限制）"
             elif [ -n "$vadj_mod_files" ]; then
-                printf 'ADJ_ERROR=在系统目录发现模块（%s）但未加载到内核，且未找到 debugfs 节点\n' "$vadj_mod_files"
+                adj_error="在系统目录发现模块（$vadj_mod_files）但未加载到内核，且未找到 debugfs 节点"
             elif [ -n "$vadj_platform_dev" ]; then
-                printf 'ADJ_ERROR=设备树存在 %s 节点，但内核未内置或未加载 qcom_voltage_adj 驱动\n' "$vadj_platform_dev"
+                adj_error="设备树存在 $vadj_platform_dev 节点，但内核未内置或未加载 qcom_voltage_adj 驱动"
             else
-                printf 'ADJ_ERROR=未在 debugfs、内核模块目录或设备树中发现 qcom_voltage_adj 接口（当前机型/内核可能未启用该功能）\n'
+                adj_error="未在 debugfs、内核模块目录或设备树中发现 qcom_voltage_adj 接口（当前机型/内核可能未启用该功能）"
             fi
         fi
+        emit_adjustment_status
 
         if [ -r "$session/boot-cpuss-idx" ]; then
             printf 'FIRST_SDAM_IDX=%s\n' "$(cat "$session/boot-cpuss-idx")"
@@ -960,14 +1334,14 @@ case "$action" in
 
         if pdp_dev=$(find_pdp_cdb); then
             printf 'PDP_CDB_PATH=%s\n' "$pdp_dev"
-            emit_partition_block "$pdp_dev" 256 PDP_CDB_GZB64 PDP_CDB_B64 PDP_CDB_ERROR "读取 pdp_cdb 分区内容失败"
+            emit_partition_block "$pdp_dev" PDP_CDB_GZB64 PDP_CDB_B64 PDP_CDB_ERROR "读取 pdp_cdb 分区内容失败"
         else
             printf 'PDP_CDB_PATH=none\n'
         fi
 
         if pdp_fw_dev=$(find_pdp_fw); then
             printf 'PDP_FW_PATH=%s\n' "$pdp_fw_dev"
-            emit_partition_block "$pdp_fw_dev" 256 PDP_FW_GZB64 PDP_FW_B64 PDP_FW_ERROR "读取 pdp 分区内容失败"
+            emit_partition_block "$pdp_fw_dev" PDP_FW_GZB64 PDP_FW_B64 PDP_FW_ERROR "读取 pdp 分区内容失败"
         else
             printf 'PDP_FW_PATH=none\n'
         fi
@@ -1019,6 +1393,73 @@ case "$action" in
         emit_system_probe "$dbg" "$vadj_mod_loaded" "$vadj_mod_files"
         ;;
 
+    quick_status)
+        [ "$#" = 0 ] || die "quick_status 参数无效"
+        printf 'BOOT_ID=%s\n' "$boot"
+        probe_adjustment quick
+        emit_adjustment_status
+        ;;
+
+    set_auto_restore)
+        set_auto_restore "$@"
+        ;;
+
+    read_power_records)
+        power_file=$persistent/power-records.csv
+        if [ -r "$power_file" ] && [ -s "$power_file" ]; then
+            printf 'POWER_RECORDS_BEGIN\n'
+            awk '1' "$power_file"
+            printf 'POWER_RECORDS_END\n'
+        else
+            printf 'POWER_RECORDS_EMPTY=1\n'
+        fi
+        ;;
+
+    write_power_records)
+        power_file=$persistent/power-records.csv
+        b64=$1
+        if [ -z "$b64" ]; then
+            rm -f -- "$power_file"
+            exit 0
+        fi
+        [ "${#b64}" -le 65536 ] || die "功耗记录数据超出限制"
+        printf '%s' "$b64" | base64 -d > "$work/power-records.raw" 2>/dev/null || die "功耗记录解码失败"
+        awk '
+            NF == 0 { next }
+            /^[1-7],[0-9]+,[0-9]+,[0-9]+,[0-9]+,[0-9]+,[0-9]+,[0-9]+,[0-9]+(,[0-9]+,[0-9]+,-?[0-9]+)?$/ { print; next }
+            { bad = 1; exit 1 }
+            END { if (bad) exit 1 }
+        ' "$work/power-records.raw" > "$work/power-records.clean" || die "功耗记录格式无效"
+        if [ -s "$work/power-records.clean" ]; then
+            mv -f "$work/power-records.clean" "$power_file" || die "保存功耗记录失败"
+        else
+            rm -f -- "$power_file"
+        fi
+        ;;
+
+    read_auto_restore)
+        if [ -r /data/adb/modules/voltset/boot-completed.sh ] ||
+            [ -r /data/adb/modules_update/voltset/boot-completed.sh ]; then
+            printf 'KSU_MODULE_INSTALLED=1\n'
+        else
+            printf 'KSU_MODULE_INSTALLED=0\n'
+        fi
+        if [ -r "$auto_conf" ]; then
+            printf 'AUTO_RESTORE_CONF_BEGIN\n'
+            awk '1' "$auto_conf"
+            printf 'AUTO_RESTORE_CONF_END\n'
+        fi
+        if [ -r "$auto_status" ]; then
+            printf 'AUTO_RESTORE_STATUS_BEGIN\n'
+            awk '1' "$auto_status"
+            printf 'AUTO_RESTORE_STATUS_END\n'
+        fi
+        ;;
+
+    auto_restore)
+        restore_on_boot "$@"
+        ;;
+
     set_override)
         [ "$#" = 4 ] || die "set_override 参数数量无效"
         [ "$1" = "$boot" ] || die "启动 ID 已改变，请刷新状态后重试"
@@ -1030,49 +1471,8 @@ case "$action" in
 
         discover_vadj_platform
         discover_sdam2_nvmem
-        if find_adj_pair; then
-            [ -e "$adj_dir/set_overrides" ] || die "缺少 qcom_voltage_adj/set_overrides 节点"
-            [ -r "$adj_dir/get_overrides" ] || die "缺少 qcom_voltage_adj/get_overrides 节点"
-
-            verify_overrides "$adj_dir/get_overrides" "$expected_cpuss" "$target_global"
-            if [ ! -f "$session/boot-cpuss-idx" ]; then
-                printf '%s\n' "$cpuss_idx" > "$session/boot-cpuss-idx"
-            fi
-            printf '%s %s\n' "$boot" "$target_cpuss" > "$work/last-set" || die "无法创建档位记录"
-
-            dec=$(( (target_cpuss << 4) | target_global ))
-            printf '%s\n' "$dec" > "$adj_dir/set_overrides" || die "写入 set_overrides 失败"
-
-            read_overrides_indices "$adj_dir/get_overrides" || die "写入后回读 get_overrides 失败"
-            [ "$cpuss_idx" = "$target_cpuss" ] && [ "$global_idx" = "$target_global" ] ||
-                die "写入校验失败：读回为 CPUSS=$cpuss_idx Global=$global_idx（期望 $target_cpuss/$target_global）"
-            mv "$work/last-set" "$last_set" || die "SDAM 已写入，但无法保存重启核对记录"
-
-            read_reg_7151 "$dbg" "$vadj_spmi_parent"
-            printf 'SDAM_CPUSS_IDX=%s\n' "$cpuss_idx"
-            printf 'SDAM_GLOBAL_IDX=%s\n' "$global_idx"
-            printf 'REG_7151=%s\n' "$reg_7151"
-        elif [ -n "$sdam_nvmem_path" ] && [ -r "$sdam_nvmem_path" ] && [ -w "$sdam_nvmem_path" ]; then
-            read_sdam2_nvmem_overrides "$sdam_nvmem_path" || die "未找到 debugfs，且 $sdam_nvmem_path 当前 0x7151 状态未通过安全校验"
-            [ "$cpuss_idx:$global_idx" = "$expected_cpuss:$target_global" ] || die "SDAM 档位已变化，请刷新后重新确认"
-            if [ ! -f "$session/boot-cpuss-idx" ]; then
-                printf '%s\n' "$cpuss_idx" > "$session/boot-cpuss-idx"
-            fi
-            printf '%s %s\n' "$boot" "$target_cpuss" > "$work/last-set" || die "无法创建档位记录"
-
-            write_sdam2_nvmem_overrides "$sdam_nvmem_path" "$target_cpuss" "$target_global" || die "写入 $sdam_nvmem_path (0x7151) 失败"
-
-            read_sdam2_nvmem_overrides "$sdam_nvmem_path" || die "写入后回读 $sdam_nvmem_path 失败"
-            [ "$cpuss_idx" = "$target_cpuss" ] && [ "$global_idx" = "$target_global" ] ||
-                die "写入校验失败：读回为 CPUSS=$cpuss_idx Global=$global_idx（期望 $target_cpuss/$target_global）"
-            mv "$work/last-set" "$last_set" || die "SDAM 已写入，但无法保存重启核对记录"
-
-            printf 'SDAM_CPUSS_IDX=%s\n' "$cpuss_idx"
-            printf 'SDAM_GLOBAL_IDX=%s\n' "$global_idx"
-            printf 'REG_7151=%s\n' "$sdam_hex"
-        else
-            die "未找到 debugfs/qcom_voltage_adj 或可用的 spmi_sdam2/nvmem 接口"
-        fi
+        find_adj_pair || true
+        write_override "$target_cpuss" "$expected_cpuss" "$target_global"
         ;;
 
     save_baseline)

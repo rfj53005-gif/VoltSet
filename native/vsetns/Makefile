@@ -1,4 +1,10 @@
-NDK_BIN ?= /home/ncf/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin
+NDK_HOME ?= $(ANDROID_NDK_HOME)
+ifeq ($(strip $(NDK_HOME)),)
+ifneq ($(strip $(ANDROID_HOME)),)
+NDK_HOME := $(lastword $(sort $(wildcard $(ANDROID_HOME)/ndk/*)))
+endif
+endif
+NDK_BIN ?= $(NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64/bin
 CC := $(NDK_BIN)/aarch64-linux-android30-clang
 STRIP := $(NDK_BIN)/llvm-strip
 
@@ -12,6 +18,7 @@ OUT := prebuilt/arm64-v8a/vsetns
 all: $(OUT)
 
 $(OUT): vsetns.c
+	@test -x "$(CC)" || { echo "Missing NDK clang at $(CC); set ANDROID_NDK_HOME or NDK_BIN" >&2; exit 1; }
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 	$(STRIP) --strip-all $@

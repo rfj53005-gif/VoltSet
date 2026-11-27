@@ -153,6 +153,58 @@ internal class GpuVendorBoot private constructor(
         return changeRows(draft, bin, rows)
     }
 
+    fun shiftBinVoltage(
+        draft: GpuDraft,
+        bin: Int,
+        stepDelta: Int,
+        corners: GpuVoltageCorners? = null,
+        minFreqHz: Long = 0L,
+    ): GpuDraft {
+        if (stepDelta == 0) return draft
+        val current = rows(draft, bin)
+        val cornerLadder = corners?.availableLevels
+            ?.map(Int::toLong)
+            ?.filter { it in voltageLevels }
+            ?.distinct()
+            ?.sorted()
+            ?.takeIf { it.size >= 2 }
+        val ladder = cornerLadder ?: voltageLevels.sorted()
+        if (ladder.isEmpty()) return draft
+
+        val active = current.filter { it.value.frequencyHz > 0 }.toMutableList()
+        val idle = current.filter { it.value.frequencyHz == 0L }
+        val shiftedMask = BooleanArray(active.size)
+
+        for (i in active.indices) {
+            val row = active[i]
+            if (row.value.frequencyHz < minFreqHz) continue
+            val resolved = corners?.resolve(row.value.voltageLevel)?.level?.toLong()
+            val curIndex = ladder.indexOf(row.value.voltageLevel).takeIf { it >= 0 }
+                ?: resolved?.let { ladder.indexOf(it).takeIf { idx -> idx >= 0 } }
+                ?: ladder.indexOfFirst { it >= row.value.voltageLevel }.let { if (it >= 0) it else ladder.lastIndex }
+            val nextIndex = (curIndex + stepDelta).coerceIn(0, ladder.lastIndex)
+            val nextVoltage = ladder[nextIndex]
+            active[i] = row.copy(value = row.value.copy(voltageLevel = nextVoltage))
+            shiftedMask[i] = true
+        }
+
+        // Preserve non-increasing voltage from highest frequency (index 0) down to lowest active.
+        for (i in active.lastIndex - 1 downTo 0) {
+            val higherFreqRow = active[i]
+            val lowerFreqRow = active[i + 1]
+            if (higherFreqRow.value.voltageLevel < lowerFreqRow.value.voltageLevel &&
+                (shiftedMask[i] || shiftedMask[i + 1])
+            ) {
+                active[i] = higherFreqRow.copy(
+                    value = higherFreqRow.value.copy(voltageLevel = lowerFreqRow.value.voltageLevel),
+                )
+            }
+        }
+
+        val finalRows = active.map { carryAcd(bin, it) } + idle
+        return changeRows(draft, bin, finalRows)
+    }
+
     private fun sourceAcd(bin: Int, frequencyHz: Long): Long? =
         baseRows.getValue(bin).singleOrNull { it.value.frequencyHz == frequencyHz }?.value?.acdLevel
 

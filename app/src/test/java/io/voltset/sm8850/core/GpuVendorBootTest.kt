@@ -178,6 +178,38 @@ class GpuVendorBootTest {
         }
     }
 
+    @Test
+    fun shiftBinVoltageShiftsAllOrHighFreqsClampsBoundsAndPreservesMonotonicity() {
+        val image = vendorBoot(tree(900_000_000)).read(0)
+        // Sorted voltageLevels ladder across fixture bins: [172, 184, 188, 196, 200]
+        // Bin 1 initial levels: 1075MHz->196, 700MHz->184, 500MHz->172
+        val shiftedBin1 = image.shiftBinVoltage(GpuDraft(), bin = 1, stepDelta = -1)
+        assertEquals(
+            listOf(188L, 172L, 172L),
+            image.rows(shiftedBin1, 1).map { it.value.voltageLevel },
+        )
+        // Non-target bin 0 remains completely untouched.
+        assertEquals(
+            listOf(200L, 188L),
+            image.rows(shiftedBin1, 0).map { it.value.voltageLevel },
+        )
+
+        // High-frequency only shift (minFreqHz = 1_000_000_000) lowers 1075MHz without violating monotonicity.
+        val highOnly = image.shiftBinVoltage(
+            GpuDraft(),
+            bin = 1,
+            stepDelta = -3,
+            minFreqHz = 1_000_000_000L,
+        )
+        val highRows = image.rows(highOnly, 1).map { it.value.voltageLevel }
+        // 196 -> -3 steps -> 172, clamped >= next lower row (184) so top becomes 184; lower freqs stay [184, 172].
+        assertEquals(listOf(184L, 184L, 172L), highRows)
+
+        // Extreme negative shift clamps cleanly at lowest ladder level without errors.
+        val clampedBottom = image.shiftBinVoltage(GpuDraft(), bin = 1, stepDelta = -50)
+        assertEquals(listOf(172L, 172L, 172L), image.rows(clampedBottom, 1).map { it.value.voltageLevel })
+    }
+
     private fun replace(table: GpuVendorBoot, top: GpuLevelValue): GpuDraft {
         val rows = table.rows(GpuDraft(), 0)
         return table.changeRows(GpuDraft(), 0, listOf(rows[0].copy(value = top)) + rows.drop(1))

@@ -1,5 +1,7 @@
 package io.voltset.sm8850.core
 
+import java.util.Locale
+
 /** Read-only device environment discovery details collected by `voltset.sh status`. */
 data class SystemProbeInfo(
     val adjDirPath: String? = null,
@@ -23,7 +25,18 @@ data class SystemProbeInfo(
     val qptRails: List<String> = emptyList(),
     val sdam2NvmemPath: String? = null,
     val sdam2Pmic: String? = null,
+    val bootReason: String? = null,
+    val pstoreCrash: String? = null,
 ) {
+    val isAbnormalBoot: Boolean
+        get() {
+            val lower = bootReason?.lowercase(Locale.US) ?: return false
+            return ABNORMAL_BOOT_KEYWORDS.any { it in lower }
+        }
+
+    val hasPstoreCrash: Boolean
+        get() = pstoreCrash != null
+
     val hasAnyData: Boolean
         get() = adjDirPath != null || regmapNode != null || vadjPlatformDevice != null ||
             vadjModuleLoaded || vadjModuleFiles.isNotEmpty() || debugfsMounts.isNotEmpty() ||
@@ -31,7 +44,14 @@ data class SystemProbeInfo(
             byNameDirs.isNotEmpty() || scmiDrivers.isNotEmpty() || scmiDeviceCount > 0 ||
             cpufreqPolicies.isNotEmpty() || energyModelDomains.isNotEmpty() || socInfo != null ||
             qfpromAging != null || qptRails.isNotEmpty() ||
-            sdam2NvmemPath != null || sdam2Pmic != null
+            sdam2NvmemPath != null || sdam2Pmic != null ||
+            bootReason != null || pstoreCrash != null
+
+    companion object {
+        private val ABNORMAL_BOOT_KEYWORDS = listOf(
+            "watchdog", "wdog", "wdt", "panic", "crash", "lockup", "fatal",
+        )
+    }
 }
 
 /** Parser for the `PROBE_BEGIN` ... `PROBE_END` section emitted by `voltset.sh status`. */
@@ -72,6 +92,8 @@ object SystemProbeParser {
             qptRails = splitCsv(kv["qpt_rails"]),
             sdam2NvmemPath = cleanScalar(kv["sdam2_nvmem"]),
             sdam2Pmic = cleanScalar(kv["sdam2_pmic"]),
+            bootReason = cleanScalar(kv["boot_reason"]),
+            pstoreCrash = cleanScalar(kv["pstore_crash"]),
         )
     }
 

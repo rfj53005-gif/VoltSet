@@ -7,6 +7,18 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 
+internal fun startRootProcess(
+    arguments: List<String>,
+    configure: ProcessBuilder.() -> Unit,
+): Process {
+    val quoted = arguments.joinToString(" ") { "'" + it.replace("'", "'\\''") + "'" }
+    return try {
+        ProcessBuilder("su", "-c", quoted).apply(configure).start()
+    } catch (e: IOException) {
+        throw IllegalStateException("无法启动 Root 请求，请检查 KernelSU 或 Magisk 授权", e)
+    }
+}
+
 internal suspend fun <T> runRootCommand(
     cacheDir: File,
     arguments: List<String>,
@@ -15,19 +27,14 @@ internal suspend fun <T> runRootCommand(
     consume: suspend (output: File, exitCode: Int, stderr: String) -> T,
 ): T = withContext(Dispatchers.IO) {
     val command = listOf("/system/bin/timeout", "-k", "2s", "${timeoutSeconds}s") + arguments
-    val quoted = command.joinToString(" ") { "'" + it.replace("'", "'\\''") + "'" }
     val output = File.createTempFile("voltset-root-", ".out", cacheDir)
     var diagnostics: File? = null
     try {
         if (!mergeStderr) diagnostics = File.createTempFile("voltset-root-", ".err", cacheDir)
-        val process = try {
-            ProcessBuilder("su", "-c", quoted)
-                .redirectErrorStream(mergeStderr)
-                .redirectOutput(output)
-                .apply { diagnostics?.let { redirectError(it) } }
-                .start()
-        } catch (e: IOException) {
-            throw IllegalStateException("无法启动 Root 请求，请检查 KernelSU 或 Magisk 授权", e)
+        val process = startRootProcess(command) {
+            redirectErrorStream(mergeStderr)
+            redirectOutput(output)
+            diagnostics?.let { redirectError(it) }
         }
         val exitCode = try {
             process.outputStream.close()

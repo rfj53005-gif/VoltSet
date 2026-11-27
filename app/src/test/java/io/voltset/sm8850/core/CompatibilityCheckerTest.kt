@@ -3,6 +3,7 @@ package io.voltset.sm8850.core
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -203,6 +204,35 @@ class CompatibilityCheckerTest {
         assertTrue(probe.vadjModuleFiles.isEmpty())
         assertTrue(probe.pdpCdtPartitions.isEmpty())
         assertEquals(0, probe.scmiDeviceCount)
+    }
+
+    @Test
+    fun systemProbeDetectsAbnormalBootAndPstoreAndIncludesThemInTextReport() {
+        val normalProbe = SystemProbeParser.parse(
+            """
+            boot_reason=reboot,userrequested
+            pstore_crash=none
+            """.trimIndent(),
+        )
+        assertEquals("reboot,userrequested", normalProbe.bootReason)
+        assertNull(normalProbe.pstoreCrash)
+        assertFalse(normalProbe.isAbnormalBoot)
+        assertFalse(normalProbe.hasPstoreCrash)
+
+        val crashProbe = SystemProbeParser.parse(
+            """
+            boot_reason=kernel_panic
+            pstore_crash=console-ramoops-0
+            """.trimIndent(),
+        )
+        assertTrue(crashProbe.isAbnormalBoot)
+        assertTrue(crashProbe.hasPstoreCrash)
+
+        val input = sampleInput()
+        val report = CompatibilityChecker.evaluate(input)
+        val text = CompatibilityChecker.formatTextReport(sampleSnapshot(input, report, crashProbe), "0.6.0")
+        assertTrue(text.contains("启动原因 (boot_reason): kernel_panic"))
+        assertTrue(text.contains("内核崩溃记录 (pstore): console-ramoops-0"))
     }
 
     private fun sampleInput(

@@ -10,6 +10,7 @@ data class QptRawSample(
     val cpu0FreqKhz: Int = 0,
     val cpu1FreqKhz: Int = 0,
     val gpuFreqHz: Long = 0L,
+    val cpuTempC: Double? = null,
 )
 
 /** Per-interval average hardware power (`mW`) computed between two QPT energy samples. */
@@ -22,6 +23,7 @@ data class QptInstantPower(
     val cpu0FreqKhz: Int = 0,
     val cpu1FreqKhz: Int = 0,
     val gpuFreqHz: Long = 0L,
+    val cpuTempC: Double? = null,
 ) {
     val cpuTotalMw: Double?
         get() = if (cpuMidMw == null && cpuLargeMw == null) {
@@ -47,6 +49,9 @@ data class QptSessionStats(
     val avgCpuTotalMw: Double?,
     val avgGpuMw: Double?,
     val avgNspMw: Double?,
+    val avgCpu0Mhz: Int = 0,
+    val avgCpu1Mhz: Int = 0,
+    val avgCpuTempC: Double? = null,
 )
 
 /** Saved hardware average power snapshot for a given OEM Set ID, used for Set-to-Set comparison. */
@@ -60,6 +65,9 @@ data class SavedSetPowerRecord(
     val avgGpuMw: Int,
     val avgNspMw: Int,
     val recordedAtMs: Long,
+    val avgCpu0Mhz: Int = 0,
+    val avgCpu1Mhz: Int = 0,
+    val avgCpuTempC: Double? = null,
 )
 
 /** Parser and calculator for Qualcomm QPT hardware powercap energy counters. */
@@ -69,6 +77,17 @@ object QptPowerParser {
     private const val RAIL_GPU = "gpu"
     private const val RAIL_NSP = "nsp"
     private const val MIN_DT_NS = 50_000_000L
+    private const val SAMPLE_PREFIX = "QPT_SAMPLE_NS="
+
+    fun parseStreamFrame(line: String): QptRawSample? {
+        if (!line.startsWith(SAMPLE_PREFIX)) return null
+        val separator = line.indexOf('\t')
+        if (separator <= SAMPLE_PREFIX.length) return null
+        val timestampNs = line.substring(SAMPLE_PREFIX.length, separator).toLongOrNull()
+            ?.takeIf { it > 0 } ?: return null
+        return parseSample(line.substring(separator + 1).replace('\t', '\n'), timestampNs)
+            .takeIf { it.energyUjByRail.isNotEmpty() }
+    }
 
     fun parseSample(output: String, timestampNs: Long): QptRawSample {
         val energyByRail = linkedMapOf<String, Long>()
@@ -76,6 +95,7 @@ object QptPowerParser {
         var cpu0Freq = 0
         var cpu1Freq = 0
         var gpuFreq = 0L
+        var cpuTempC: Double? = null
 
         for (rawLine in output.lineSequence()) {
             val line = rawLine.trim()
@@ -108,6 +128,7 @@ object QptPowerParser {
                 "FREQ_CPU0_KHZ" -> cpu0Freq = value.toIntOrNull()?.coerceAtLeast(0) ?: 0
                 "FREQ_CPU1_KHZ" -> cpu1Freq = value.toIntOrNull()?.coerceAtLeast(0) ?: 0
                 "FREQ_GPU_HZ" -> gpuFreq = value.toLongOrNull()?.coerceAtLeast(0L) ?: 0L
+                "TEMP_CPU_MC" -> cpuTempC = value.toDoubleOrNull()?.takeIf { it in 1000.0..130000.0 }?.div(1000.0)
             }
         }
 
@@ -118,6 +139,7 @@ object QptPowerParser {
             cpu0FreqKhz = cpu0Freq,
             cpu1FreqKhz = cpu1Freq,
             gpuFreqHz = gpuFreq,
+            cpuTempC = cpuTempC,
         )
     }
 
@@ -153,6 +175,7 @@ object QptPowerParser {
             cpu0FreqKhz = curr.cpu0FreqKhz,
             cpu1FreqKhz = curr.cpu1FreqKhz,
             gpuFreqHz = curr.gpuFreqHz,
+            cpuTempC = curr.cpuTempC,
         )
     }
 
@@ -177,6 +200,9 @@ object QptPowerParser {
         val cpuTotal = weightedMean { it.cpuTotalMw }
         val gpu = weightedMean { it.gpuMw }
         val nsp = weightedMean { it.nspMw }
+        val cpu0Mhz = weightedMean { it.cpu0FreqKhz.takeIf { f -> f > 0 }?.div(1000.0) }?.roundToInt() ?: 0
+        val cpu1Mhz = weightedMean { it.cpu1FreqKhz.takeIf { f -> f > 0 }?.div(1000.0) }?.roundToInt() ?: 0
+        val tempC = weightedMean { it.cpuTempC }
 
         return QptSessionStats(
             sampleCount = samples.size,
@@ -186,6 +212,9 @@ object QptPowerParser {
             avgCpuTotalMw = cpuTotal,
             avgGpuMw = gpu,
             avgNspMw = nsp,
+            avgCpu0Mhz = cpu0Mhz,
+            avgCpu1Mhz = cpu1Mhz,
+            avgCpuTempC = tempC,
         )
     }
 
@@ -205,6 +234,9 @@ object QptPowerParser {
             avgGpuMw = (stats.avgGpuMw ?: 0.0).roundToInt(),
             avgNspMw = (stats.avgNspMw ?: 0.0).roundToInt(),
             recordedAtMs = recordedAtMs,
+            avgCpu0Mhz = stats.avgCpu0Mhz,
+            avgCpu1Mhz = stats.avgCpu1Mhz,
+            avgCpuTempC = stats.avgCpuTempC,
         )
     }
 
@@ -212,6 +244,7 @@ object QptPowerParser {
         records.values
             .sortedBy { it.setId }
             .joinToString("\n") { r ->
+                val tempDeci = r.avgCpuTempC?.let { (it * 10.0).roundToInt() } ?: -1
                 listOf(
                     r.setId,
                     r.sampleCount,
@@ -222,6 +255,9 @@ object QptPowerParser {
                     r.avgGpuMw,
                     r.avgNspMw,
                     r.recordedAtMs,
+                    r.avgCpu0Mhz,
+                    r.avgCpu1Mhz,
+                    tempDeci,
                 ).joinToString(",")
             }
 
@@ -240,6 +276,11 @@ object QptPowerParser {
             val gpu = cols[6].toIntOrNull()?.coerceAtLeast(0) ?: continue
             val nsp = cols[7].toIntOrNull()?.coerceAtLeast(0) ?: continue
             val ts = cols[8].toLongOrNull()?.coerceAtLeast(0L) ?: 0L
+            val cpu0Mhz = if (cols.size >= 12) cols[9].toIntOrNull()?.coerceAtLeast(0) ?: 0 else 0
+            val cpu1Mhz = if (cols.size >= 12) cols[10].toIntOrNull()?.coerceAtLeast(0) ?: 0 else 0
+            val tempC = if (cols.size >= 12) {
+                cols[11].toIntOrNull()?.takeIf { it >= 0 }?.div(10.0)
+            } else null
             map[setId] = SavedSetPowerRecord(
                 setId = setId,
                 sampleCount = sampleCount,
@@ -250,6 +291,9 @@ object QptPowerParser {
                 avgGpuMw = gpu,
                 avgNspMw = nsp,
                 recordedAtMs = ts,
+                avgCpu0Mhz = cpu0Mhz,
+                avgCpu1Mhz = cpu1Mhz,
+                avgCpuTempC = tempC,
             )
         }
         return map

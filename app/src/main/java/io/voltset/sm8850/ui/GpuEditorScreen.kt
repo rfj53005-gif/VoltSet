@@ -1,11 +1,15 @@
 package io.voltset.sm8850.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -39,16 +43,22 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import io.voltset.sm8850.GpuEditorState
 import io.voltset.sm8850.GpuEditorViewModel
+import io.voltset.sm8850.GpuExportResult
+import io.voltset.sm8850.GpuVoltageReference
 import io.voltset.sm8850.core.GpuAuxTable
 import io.voltset.sm8850.core.GpuDraft
 import io.voltset.sm8850.core.GpuLevelValue
 import io.voltset.sm8850.core.GpuRow
 import io.voltset.sm8850.core.GpuTableId
 import io.voltset.sm8850.core.GpuVendorBoot
+import io.voltset.sm8850.core.GpuVoltageEstimate
 import io.voltset.sm8850.core.GpuVoltageScore
 import java.math.BigDecimal
 import java.util.Locale
@@ -64,6 +74,7 @@ internal fun GpuEditorScreen(
     onPickConfig: () -> Unit,
     onSaveConfig: (String) -> Unit,
     onSaveImage: (String) -> Unit,
+    onSaveStockBackup: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val snapshot = state.snapshot
@@ -84,19 +95,26 @@ internal fun GpuEditorScreen(
     }
     val image = snapshot.image
     val bin = image.bins.firstOrNull { it.index == state.selectedBin } ?: image.bins.first()
-    val stockLevels = snapshot.stockVoltages[bin.speedBin]
+    val reference = if (state.useLocalBaseline && state.localBaseline != null) {
+        state.localBaseline
+    } else {
+        snapshot.voltageReference ?: state.localBaseline
+    }
+    val stockLevels = reference?.levelsFor(bin.speedBin)
     val voltageCorners = snapshot.voltageCorners
     val sourceRows = image.rows(GpuDraft(), bin.index)
     val rows = image.rows(state.draft, bin.index)
-    val sourceScore = remember(sourceRows, stockLevels, voltageCorners) {
-        if (stockLevels != null && voltageCorners != null) GpuVoltageScore.evaluate(sourceRows, stockLevels, voltageCorners)
-        else null
+    val sourceScore = remember(sourceRows, reference, stockLevels, voltageCorners) {
+        if (reference != null && stockLevels != null && voltageCorners != null) {
+            GpuVoltageScore.evaluate(sourceRows, stockLevels, voltageCorners, reference.corners)
+        } else null
     }
-    val draftScore = remember(rows, sourceRows, stockLevels, voltageCorners) {
+    val draftScore = remember(rows, sourceRows, reference, stockLevels, voltageCorners) {
         val changed = rows.map { it.value.frequencyHz to it.value.voltageLevel } !=
             sourceRows.map { it.value.frequencyHz to it.value.voltageLevel }
-        if (changed && stockLevels != null && voltageCorners != null) GpuVoltageScore.evaluate(rows, stockLevels, voltageCorners)
-        else null
+        if (changed && reference != null && stockLevels != null && voltageCorners != null) {
+            GpuVoltageScore.evaluate(rows, stockLevels, voltageCorners, reference.corners)
+        } else null
     }
     val factoryAcdChanges = remember(image, rows, bin.index) {
         rows.count { row ->
@@ -114,12 +132,13 @@ internal fun GpuEditorScreen(
     var adding by remember(image, bin.index) { mutableStateOf(false) }
     var copyLevel by remember(image, bin.index) { mutableStateOf<Int?>(null) }
     var copyingBin by remember(image, bin.index) { mutableStateOf(false) }
+    var batchShifting by remember(image, bin.index) { mutableStateOf(false) }
     var reviewing by rememberSaveable { mutableStateOf(false) }
     var localError by remember(image) { mutableStateOf<String?>(null) }
 
     Column(modifier) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
-            Text("${source.device} · 槽 $slot · DTB ${source.dtbIndex}", style = MaterialTheme.typography.bodySmall)
+            Text("${source.device} · 槽 $slot · DTB ${source.dtbIndex} · ${source.build}", style = MaterialTheme.typography.bodySmall)
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 for (option in Panel.entries) {
                     FilterChip(selected = option == panel, onClick = { panelName = option.name }, label = { Text(option.title) })
@@ -160,15 +179,43 @@ internal fun GpuEditorScreen(
                         }
                         Text("运行 ACD · $acd", style = MaterialTheme.typography.bodySmall)
                         if (snapshot.activeBin == null) {
-                            Text("运行频点未唯一匹配，请确认选中的表。", style = MaterialTheme.typography.bodySmall)
+                            Text(
+                                if (snapshot.dtboPresent) {
+                                    "运行频点未唯一匹配，请确认选中的表（检测到 dtbo 分区，部分机型 GPU 频压可能由 dtbo overlay 覆盖）。"
+                                } else {
+                                    "运行频点未唯一匹配，请确认选中的表。"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                            )
                         }
                     }
                     item {
-                        VoltageScoreCard(source.build, sourceScore, draftScore, stockLevels != null)
+                        val sharedFrequencies = reference?.voltages?.containsKey(bin.speedBin) == false
+                        VoltageScoreCard(
+                            reference = reference,
+                            source = sourceScore,
+                            draft = draftScore,
+                            sharedFrequencies = sharedFrequencies,
+                            hasGenericReference = snapshot.voltageReference != null,
+                            hasLocalBaseline = state.localBaseline != null,
+                            useLocalBaseline = state.useLocalBaseline || snapshot.voltageReference == null,
+                            canSaveLocalBaseline = state.editable && snapshot.voltageCorners != null,
+                            onSelectBaseline = model::setUseLocalBaseline,
+                            onSaveLocalBaseline = model::saveLocalBaseline,
+                        )
                     }
                     item {
-                        Curve(sourceRows, rows)
+                        val draftEstimate = draftScore?.estimate
+                        val estimate = draftEstimate ?: sourceScore?.estimate
+                        if (estimate != null) {
+                            VoltageCurveComparison(estimate, if (draftEstimate != null) "草稿" else "当前镜像")
+                        } else {
+                            Curve(sourceRows, rows)
+                        }
                         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            TextButton(onClick = { batchShifting = true }, enabled = state.editable) {
+                                Text("批量调压")
+                            }
                             TextButton(onClick = { adding = true }, enabled = state.editable && image.canInsert(bin, rows)) {
                                 Text("新增频点")
                             }
@@ -186,7 +233,7 @@ internal fun GpuEditorScreen(
                             Text("电压请求档", style = MaterialTheme.typography.labelLarge)
                         }
                     }
-                    itemsIndexed(rows, key = { _, row -> row.value.frequencyHz }) { index, row ->
+                    itemsIndexed(rows) { index, row ->
                         val original = image.baseValue(row.template)
                         val changed = row.value != original || row.template.bin != bin.index
                         val hz = row.value.frequencyHz
@@ -214,9 +261,13 @@ internal fun GpuEditorScreen(
                                             point.reduction < 0 -> "高 ${-point.reduction} 档"
                                             else -> "同档"
                                         }
-                                        Text("原厂 GFX ${point.factoryLevel} · $difference", style = MaterialTheme.typography.labelSmall)
-                                    } else if (hz > 0 && stockLevels != null && hz !in stockLevels) {
-                                        Text("原厂表无同频点", style = MaterialTheme.typography.labelSmall)
+                                        Text("基准 GFX ${point.factoryLevel} · $difference", style = MaterialTheme.typography.labelSmall)
+                                    } else if (hz > 0 && stockLevels != null) {
+                                        if (hz !in stockLevels) {
+                                            Text("基准表无同频点", style = MaterialTheme.typography.labelSmall)
+                                        } else if (voltageCorners != null) {
+                                            Text("有效 GFX 档位暂无匹配基准", style = MaterialTheme.typography.labelSmall)
+                                        }
                                     }
                                 }
                                 Column(horizontalAlignment = Alignment.End) {
@@ -256,6 +307,10 @@ internal fun GpuEditorScreen(
                 horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(if (state.draft.isEmpty) "源镜像" else "草稿 · ${state.draft.bins.size + state.draft.tables.size} 张表",
                     Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                TextButton(
+                    onClick = { onSaveStockBackup("$filename-stock-$slot.img") },
+                    enabled = state.editable,
+                ) { Text("备份原厂") }
                 TextButton(onClick = { localError = null; model.clearDraft() }, enabled = state.editable && !state.draft.isEmpty) { Text("清空") }
                 Button(onClick = { reviewing = true }, enabled = state.editable && !state.draft.isEmpty) { Text("预览并导出") }
             }
@@ -296,6 +351,16 @@ internal fun GpuEditorScreen(
             onPick = { localError = model.copyBin(bin.index, it.toInt()); copyingBin = false },
         )
     }
+    if (batchShifting && state.editable) {
+        BatchShiftDialog(
+            binIndex = bin.index,
+            onDismiss = { batchShifting = false },
+            onApplyShift = { stepDelta, minFreqHz ->
+                localError = model.shiftBinVoltage(bin.index, stepDelta, minFreqHz)
+                batchShifting = false
+            },
+        )
+    }
     val incoming = state.incoming
     if (state.editable && (incoming != null || reviewing && !state.draft.isEmpty)) {
         val candidate = incoming ?: state.draft
@@ -311,6 +376,19 @@ internal fun GpuEditorScreen(
                 Column(Modifier.heightIn(max = 350.dp).verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(7.dp)) {
                     Text("槽 $slot · DTB ${source.dtbIndex}")
+                    if (incoming == null && snapshot.hasAvbFooter) {
+                        Surface(
+                            shape = MaterialTheme.shapes.small,
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                        ) {
+                            Text(
+                                text = "AVB 提醒：检测到 vendor_boot 末尾含 AVBf 校验脚标。直接刷入修改镜像前请确认 vbmeta 已禁用校验，并保留一份原厂镜像备份。",
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.padding(8.dp),
+                            )
+                        }
+                    }
                     for (line in summary) Text(line, style = MaterialTheme.typography.bodySmall)
                 }
             },
@@ -326,14 +404,23 @@ internal fun GpuEditorScreen(
             dismissButton = { TextButton(onClick = ::close) { Text("返回") } },
         )
     }
+    state.lastExportResult?.let { result ->
+        ExportResultDialog(result = result, onDismiss = model::dismissExportResult)
+    }
 }
 
 @Composable
 private fun VoltageScoreCard(
-    build: String,
+    reference: GpuVoltageReference?,
     source: GpuVoltageScore?,
     draft: GpuVoltageScore?,
-    hasStockLevels: Boolean,
+    sharedFrequencies: Boolean,
+    hasGenericReference: Boolean,
+    hasLocalBaseline: Boolean,
+    useLocalBaseline: Boolean,
+    canSaveLocalBaseline: Boolean,
+    onSelectBaseline: (Boolean) -> Unit,
+    onSaveLocalBaseline: () -> Unit,
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -341,33 +428,124 @@ private fun VoltageScoreCard(
         color = MaterialTheme.colorScheme.primaryContainer,
         contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
     ) {
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            Text("GPU 电压评分", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            if (source == null) {
-                Text(if (hasStockLevels) "未读到 GFX 电压档位表" else "此机型、系统版本和分档暂无已核对的原厂表",
-                    style = MaterialTheme.typography.bodySmall)
-            } else {
-                Row(horizontalArrangement = Arrangement.spacedBy(20.dp)) {
-                    VoltageScoreValue("当前镜像", source, Modifier.weight(1f))
-                    draft?.let { VoltageScoreValue("草稿", it, Modifier.weight(1f)) }
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("GPU 电压评分", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                if (canSaveLocalBaseline) {
+                    TextButton(onClick = onSaveLocalBaseline) {
+                        Text(if (hasLocalBaseline) "更新本机基准" else "存为本机基准")
+                    }
                 }
-                Text("原厂 $build · 基准 100 分", style = MaterialTheme.typography.bodySmall)
-                Text("同频 GFX 档差按全部原厂频点平均", style = MaterialTheme.typography.bodySmall)
+            }
+            if (hasGenericReference && hasLocalBaseline) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = !useLocalBaseline,
+                        onClick = { onSelectBaseline(false) },
+                        label = { Text("SM8850 通用基准") },
+                    )
+                    FilterChip(
+                        selected = useLocalBaseline,
+                        onClick = { onSelectBaseline(true) },
+                        label = { Text("本机原厂基准") },
+                    )
+                }
+            }
+            if (source == null || reference == null) {
+                Text(
+                    if (reference == null) "当前芯片平台暂无评分基准（可点击右上角保存本机镜像为基准）" else "未读到 GFX 电压档位表",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    VoltageScoreSection("当前镜像", source)
+                    draft?.let { VoltageScoreSection("草稿", it) }
+                }
+                val label = if (useLocalBaseline) "本机" else if (sharedFrequencies) "通用基准" else "基准"
+                Text("$label ${reference.model} · ${reference.build}", style = MaterialTheme.typography.bodySmall)
+                val estimated = source.estimate != null || draft?.estimate != null
+                Text(
+                    if (estimated) "基准 100 分 · 曲线按重叠频段的 GFX 档差积分"
+                    else "基准 100 分 · 同频 GFX 档差按全部基准频点平均",
+                    style = MaterialTheme.typography.bodySmall,
+                )
             }
         }
     }
 }
 
 @Composable
-private fun VoltageScoreValue(title: String, report: GpuVoltageScore, modifier: Modifier) {
+private fun VoltageScoreSection(title: String, report: GpuVoltageScore) {
+    val estimate = report.estimate
+    Text(title, style = MaterialTheme.typography.labelMedium)
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+        VoltageScoreValue(
+            "同频评分",
+            report.exactScore,
+            "可比频点 ${report.points.size}/${report.stockFrequencyCount}",
+            Modifier.weight(1f),
+        )
+        VoltageScoreValue(
+            "曲线估算",
+            estimate?.score,
+            if (estimate == null) "暂无可比频段"
+            else String.format(Locale.ROOT, "重叠覆盖 %.1f%%", estimate.coverage * 100),
+            Modifier.weight(1f),
+        )
+    }
+}
+
+@Composable
+private fun VoltageScoreValue(title: String, score: Double?, coverage: String, modifier: Modifier) {
     Column(modifier) {
         Text(title, style = MaterialTheme.typography.labelMedium)
         Text(
-            report.score?.let { String.format(Locale.ROOT, "%.2f", it) } ?: "—",
+            score?.let { String.format(Locale.ROOT, "%.2f", it) } ?: "—",
             style = MaterialTheme.typography.headlineSmall,
             fontWeight = FontWeight.Bold,
         )
-        Text("同频 ${report.points.size}/${report.stockFrequencyCount}", style = MaterialTheme.typography.labelSmall)
+        Text(coverage, style = MaterialTheme.typography.labelSmall)
+    }
+}
+
+@Composable
+private fun VoltageCurveComparison(estimate: GpuVoltageEstimate, currentLabel: String) {
+    val segments = estimate.referenceCurve + estimate.currentCurve
+    if (segments.isEmpty()) return
+    val minHz = segments.minOf { it.startHz }
+    val maxHz = segments.maxOf { it.endHz }
+    val minRank = segments.minOf { minOf(it.startRank, it.endRank) }
+    val maxRank = segments.maxOf { maxOf(it.startRank, it.endRank) }
+    val referenceColor = MaterialTheme.colorScheme.onSurfaceVariant
+    val currentColor = MaterialTheme.colorScheme.primary
+    Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text("原厂基准", color = referenceColor, style = MaterialTheme.typography.labelSmall)
+        Text(currentLabel, color = currentColor, style = MaterialTheme.typography.labelSmall)
+    }
+    Text("横轴为有效 GFX 档位顺序 · 纵轴为频率（MHz）", style = MaterialTheme.typography.labelSmall)
+    Canvas(Modifier.fillMaxWidth().height(88.dp).padding(8.dp)) {
+        fun point(hz: Long, rank: Int) = Offset(
+            (rank - minRank).toFloat() / (maxRank - minRank).coerceAtLeast(1) * size.width,
+            size.height - (hz - minHz).toFloat() / (maxHz - minHz).coerceAtLeast(1) * size.height,
+        )
+        for (segment in estimate.currentCurve) {
+            drawLine(currentColor, point(segment.startHz, segment.startRank), point(segment.endHz, segment.endRank), 2.dp.toPx())
+        }
+        val dashed = PathEffect.dashPathEffect(floatArrayOf(6.dp.toPx(), 3.dp.toPx()))
+        for (segment in estimate.referenceCurve) {
+            drawLine(
+                referenceColor, point(segment.startHz, segment.startRank), point(segment.endHz, segment.endRank),
+                strokeWidth = 2.dp.toPx(), pathEffect = dashed,
+            )
+        }
+    }
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text("${mhz(minHz)} MHz · GFX #$minRank", style = MaterialTheme.typography.labelSmall)
+        Text("${mhz(maxHz)} MHz · GFX #$maxRank", style = MaterialTheme.typography.labelSmall)
     }
 }
 
@@ -383,15 +561,111 @@ private fun Curve(source: List<GpuRow>, draft: List<GpuRow>) {
     val hiLevel = values.maxOf { it.voltageLevel }
     val baseColor = MaterialTheme.colorScheme.outline
     val color = MaterialTheme.colorScheme.primary
-    Text("频率（横轴） · 电压请求档（纵轴）", Modifier.padding(top = 8.dp), style = MaterialTheme.typography.labelSmall)
+    Text("电压请求档（横轴） · 频率（纵轴，MHz）", Modifier.padding(top = 8.dp), style = MaterialTheme.typography.labelSmall)
     Canvas(Modifier.fillMaxWidth().height(88.dp).padding(8.dp)) {
         fun at(point: GpuLevelValue): Offset = Offset(
-            (point.frequencyHz - loHz).toFloat() / (hiHz - loHz).coerceAtLeast(1) * size.width,
-            size.height - (point.voltageLevel - loLevel).toFloat() / (hiLevel - loLevel).coerceAtLeast(1) * size.height,
+            (point.voltageLevel - loLevel).toFloat() / (hiLevel - loLevel).coerceAtLeast(1) * size.width,
+            size.height - (point.frequencyHz - loHz).toFloat() / (hiHz - loHz).coerceAtLeast(1) * size.height,
         )
         for ((a, b) in original.zipWithNext()) drawLine(baseColor, at(a), at(b), strokeWidth = 2.dp.toPx())
         for ((a, b) in edited.zipWithNext()) drawLine(color, at(a), at(b), strokeWidth = 2.dp.toPx())
     }
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text("${mhz(loHz)} MHz · 档 $loLevel", style = MaterialTheme.typography.labelSmall)
+        Text("${mhz(hiHz)} MHz · 档 $hiLevel", style = MaterialTheme.typography.labelSmall)
+    }
+}
+
+@Composable
+private fun BatchShiftDialog(
+    binIndex: Int,
+    onDismiss: () -> Unit,
+    onApplyShift: (stepDelta: Int, minFreqHz: Long) -> Unit,
+) {
+    var highFreqOnly by rememberSaveable { mutableStateOf(false) }
+    val minFreqHz = if (highFreqOnly) 800_000_000L else 0L
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("表 $binIndex · 批量调压") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = "按本机有效 GFX 电压阶梯统一步进微调，并自动钳位边界与保持单调递增。",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = !highFreqOnly,
+                        onClick = { highFreqOnly = false },
+                        label = { Text("全部频点") },
+                    )
+                    FilterChip(
+                        selected = highFreqOnly,
+                        onClick = { highFreqOnly = true },
+                        label = { Text("仅高频 (≥800 MHz)") },
+                    )
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Button(
+                        onClick = { onApplyShift(-1, minFreqHz) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("统一降 1 档") }
+                    OutlinedButton(
+                        onClick = { onApplyShift(-2, minFreqHz) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("统一降 2 档") }
+                    OutlinedButton(
+                        onClick = { onApplyShift(1, minFreqHz) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("统一升 1 档") }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
+}
+
+@Composable
+private fun ExportResultDialog(
+    result: GpuExportResult,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val sizeMb = String.format(Locale.ROOT, "%.1f MB", result.sizeBytes / (1024.0 * 1024.0))
+    val flashCmd = "fastboot flash ${result.partitionName} <导出的镜像.img>"
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (result.isStockBackup) "原厂镜像备份完成" else "GPU 镜像导出完成") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("目标分区：${result.partitionName} ($sizeMb)", style = MaterialTheme.typography.bodySmall)
+                Text("SHA-256：", style = MaterialTheme.typography.labelSmall)
+                Text(
+                    text = result.sha256Hex,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                )
+                Text("刷写参考命令：", style = MaterialTheme.typography.labelSmall)
+                Text(
+                    text = flashCmd,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText("SHA-256", result.sha256Hex))
+                onDismiss()
+            }) { Text("复制 SHA-256") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("关闭") }
+        },
+    )
 }
 
 @Composable

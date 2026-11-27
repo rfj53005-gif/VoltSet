@@ -12,6 +12,29 @@ import org.junit.Test
 
 class PdpFirmwareEstimatorTest {
     @Test
+    fun scmiComparisonIncludesFrequencyAndPstateOffsetsForTheSameBin() {
+        val cluster = ClusterSetSummary(
+            cluster = 0,
+            allCxMv = -5,
+            allMxMv = 0,
+            entries = listOf(
+                EffectiveAdjustment(AdjustMode.FREQ, 384_000L, -3, 0, -8, 0),
+                EffectiveAdjustment(AdjustMode.PSTATE, 4L, -7, 0, -12, 0),
+            ),
+            minCxMv = -12,
+            maxCxMv = -5,
+            minMxMv = 0,
+            maxMxMv = 0,
+        )
+        val points = listOf(
+            scmiPoint(0, 4, 384_000, 100L, 488),
+            scmiPoint(0, 5, 537_600, 100L, 492),
+        )
+        val set = VoltageSetProfile(6, cluster, cluster.copy(cluster = 1))
+        assertEquals(listOf(-15, -5), ScmiPlanParser.diff(points, null, set).map { it.expectedCdbCxMv })
+    }
+
+    @Test
     fun syntheticElfParseAndClusterMatchingWorkAcrossFlexIds() {
         val table1 = buildDcvsBlob(
             listOf(
@@ -126,8 +149,10 @@ class PdpFirmwareEstimatorTest {
 
     @Test
     fun realXiaomi17ProFirmwareDumpsMatchMeasuredSet2AndSet6Behavior() {
-        val pdpFile = File("/root/.gemini/antigravity/brain/27bc445e-30d0-4579-b066-f5be9b790ea0/scratch/fw/pdp_a.bin")
-        val cdbFile = File("/root/.gemini/antigravity/brain/27bc445e-30d0-4579-b066-f5be9b790ea0/scratch/fw/pdp_cdb_a.bin")
+        val dir = System.getenv("VOLTSET_LOCAL_FW_DIR")?.takeIf { it.isNotBlank() }
+        assumeTrue("VOLTSET_LOCAL_FW_DIR unset; skipping", dir != null)
+        val pdpFile = File(dir!!, "pdp_a.bin")
+        val cdbFile = File(dir, "pdp_cdb_a.bin")
         assumeTrue("Local Xiaomi 17 Pro dumps absent; skipping", pdpFile.isFile && cdbFile.isFile)
 
         val tables = PdpFirmwareParser.parse(pdpFile.readBytes())
@@ -139,8 +164,8 @@ class PdpFirmwareEstimatorTest {
         assertTrue(limits.isComplete)
         assertTrue(limits.clus0!!.exactTableMatch)
         assertTrue(limits.clus1!!.exactTableMatch)
-        assertEquals(28, limits.clus0!!.limitsByFreqKhz.size)
-        assertEquals(29, limits.clus1!!.limitsByFreqKhz.size)
+        assertEquals(28, limits.clus0.limitsByFreqKhz.size)
+        assertEquals(29, limits.clus1.limitsByFreqKhz.size)
 
         val estimates = VoltageSetEstimator.estimateAll(cdb.sets, baseline, limits)
 

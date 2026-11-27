@@ -2,8 +2,11 @@ package io.voltset.sm8850
 
 import android.app.Application
 import android.content.Context
+import android.net.Uri
+import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import io.voltset.sm8850.core.AutoRestoreSnapshot
 import io.voltset.sm8850.core.BaselineSource
 import io.voltset.sm8850.core.ClusterSetSummary
 import io.voltset.sm8850.core.CompatibilityChecker
@@ -19,12 +22,11 @@ import io.voltset.sm8850.core.VoltageSetProfile
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -49,20 +51,36 @@ internal data class VoltSetUiState(
     val qptMonitoring: Boolean = false,
     val qptInstant: QptInstantPower? = null,
     val qptSession: QptSessionStats? = null,
+    val qptHistory: List<QptInstantPower> = emptyList(),
     val qptError: String? = null,
     val savedPowerRecords: Map<Int, SavedSetPowerRecord> = emptyMap(),
+    val autoRestore: AutoRestoreSnapshot? = null,
+    val cpuStressRunning: Boolean = false,
+    val cpuStressStats: CpuStressStats? = null,
+    val cpuStressMessage: String? = null,
+    val cpuStressAvgPowerMw: Double? = null,
+    val cpuStressAvgCpu0Mhz: Int? = null,
+    val cpuStressAvgCpu1Mhz: Int? = null,
 ) {
     val busy: Boolean get() = loading || busyAction != null
     val controlsEnabled: Boolean get() = snapshot != null && !busy && error == null
+
+    fun canRefreshOnResume(lastSuccessfulRefreshMs: Long?, nowMs: Long): Boolean =
+        !busy && !cpuStressRunning && !qptMonitoring &&
+            selectedTab != VoltSetTab.GPU && pendingConfirmSet == null && !showRebootConfirm &&
+            (lastSuccessfulRefreshMs == null || nowMs - lastSuccessfulRefreshMs >= 5000L)
 }
 
 internal class VoltSetViewModel(application: Application) : AndroidViewModel(application) {
     private val backend = RootBackend(application.applicationContext)
+    private val cpuStress = CpuStress(application.applicationContext)
     private val powerPrefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val _state = MutableStateFlow(VoltSetUiState())
     val state: StateFlow<VoltSetUiState> = _state.asStateFlow()
 
+    private var lastSuccessfulRefreshMs: Long? = null
     private var qptJob: Job? = null
+    private var cpuStressJob: Job? = null
     private var lastRawSample: QptRawSample? = null
     private val qptIntervals = mutableListOf<QptInstantPower>()
 
@@ -73,21 +91,39 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
         }
     }
 
-    fun refresh() {
+    fun refreshOnResume() {
+        val current = _state.value
+        if (current.canRefreshOnResume(lastSuccessfulRefreshMs, SystemClock.elapsedRealtime())) {
+            refresh(reuse = current.snapshot.takeIf { current.error == null })
+        }
+    }
+
+    fun refresh() = refresh(reuse = null)
+
+    private fun refresh(reuse: DeviceSnapshot?) {
         if (_state.value.busy) return
         _state.update {
             it.copy(loading = true, error = null, pendingConfirmSet = null, showRebootConfirm = false)
         }
         viewModelScope.launch {
             attempt {
-                val initial = backend.readStatus()
-                maybeAutoSaveBaseline(initial)
-            }.onSuccess { snap ->
-                _state.update {
-                    it.copy(
+                val snap = if (reuse != null && backend.hasSameReadback(reuse)) {
+                    reuse
+                } else {
+                    maybeAutoSaveBaseline(backend.readStatus())
+                }
+                val sharedPower = syncPowerRecordsOnRefresh()
+                val autoRestore = attempt { backend.readAutoRestore() }.getOrNull()
+                Triple(snap, sharedPower, autoRestore)
+            }.onSuccess { (snap, sharedPower, autoRestore) ->
+                lastSuccessfulRefreshMs = SystemClock.elapsedRealtime()
+                _state.update { current ->
+                    current.copy(
                         loading = false,
                         error = null,
                         snapshot = snap,
+                        savedPowerRecords = sharedPower ?: current.savedPowerRecords,
+                        autoRestore = autoRestore ?: current.autoRestore,
                     )
                 }
             }.onFailure { err ->
@@ -99,6 +135,20 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
                 }
             }
         }
+    }
+
+    private suspend fun syncPowerRecordsOnRefresh(): Map<Int, SavedSetPowerRecord>? {
+        val shared = attempt { backend.readPowerRecords() }.getOrNull() ?: return null
+        if (shared.isNotEmpty()) {
+            persistPowerPrefs(shared)
+            return shared
+        }
+        val local = _state.value.savedPowerRecords
+        if (local.isNotEmpty()) {
+            attempt { backend.writePowerRecords(local) }
+            return local
+        }
+        return emptyMap()
     }
 
     private suspend fun maybeAutoSaveBaseline(snap: DeviceSnapshot): DeviceSnapshot {
@@ -124,6 +174,7 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
 
     fun selectTab(tab: VoltSetTab) {
         if (tab != VoltSetTab.VOLTAGE) {
+            stopCpuStress()
             stopQptMonitor()
         }
         _state.update { it.copy(selectedTab = tab) }
@@ -134,10 +185,16 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
     }
 
     fun toggleQptMonitor() {
-        if (qptJob?.isActive == true) {
+        if (_state.value.qptMonitoring) {
             stopQptMonitor()
             return
         }
+        startQptMonitorInternal()
+    }
+
+    private fun startQptMonitorInternal() {
+        if (_state.value.qptMonitoring) return
+        val previousJob = qptJob
         lastRawSample = null
         qptIntervals.clear()
         _state.update {
@@ -145,68 +202,42 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
                 qptMonitoring = true,
                 qptInstant = null,
                 qptSession = null,
+                qptHistory = emptyList(),
                 qptError = null,
             )
         }
         qptJob = viewModelScope.launch {
-            var turnedOnBySelf = false
-            var zeroDeltaStreak = 0
-            try {
-                attempt { backend.enableQptIfNeeded() }.onSuccess { changed ->
-                    turnedOnBySelf = changed
-                }.onFailure { err ->
-                    _state.update { it.copy(qptError = err.message ?: "无法开启 QPT 硬件功耗遥测") }
-                }
-
-                while (isActive) {
-                    attempt { backend.readPowerSample() }.onSuccess { sample ->
-                        val prev = lastRawSample
-                        lastRawSample = sample
-                        if (prev != null) {
-                            val delta = QptPowerParser.computeDelta(prev, sample)
-                            if (delta != null) {
-                                if (qptIntervals.size >= MAX_QPT_SAMPLES) {
-                                    qptIntervals.removeAt(0)
-                                }
-                                qptIntervals.add(delta)
-                                val session = QptPowerParser.summarizeSession(qptIntervals)
-                                zeroDeltaStreak = if ((delta.socTotalMw ?: 0.0) <= 0.001) {
-                                    zeroDeltaStreak + 1
-                                } else {
-                                    0
-                                }
-                                val frozenNotice = if (zeroDeltaStreak >= 3) {
-                                    "QPT 硬件计数器未增长（当前固件可能未启用实时功耗遥测）"
-                                } else {
-                                    null
-                                }
-                                _state.update {
-                                    it.copy(
-                                        qptInstant = delta,
-                                        qptSession = session,
-                                        qptError = frozenNotice,
-                                    )
-                                }
-                            }
-                        }
-                    }.onFailure { err ->
-                        _state.update { it.copy(qptError = err.message ?: "读取硬件功耗失败") }
-                    }
-                    delay(QPT_POLL_INTERVAL_MS)
-                }
-            } finally {
-                if (turnedOnBySelf) {
-                    withContext(NonCancellable) {
-                        attempt { backend.disableQpt() }
+            withContext(NonCancellable) { previousJob?.join() }
+            ensureActive()
+            attempt {
+                backend.streamPowerSamples().collect { sample ->
+                    val previous = lastRawSample
+                    lastRawSample = sample
+                    val delta = previous?.let { QptPowerParser.computeDelta(it, sample) } ?: return@collect
+                    if (qptIntervals.size >= MAX_QPT_SAMPLES) qptIntervals.removeAt(0)
+                    qptIntervals.add(delta)
+                    val session = QptPowerParser.summarizeSession(qptIntervals)
+                    val frozen = qptIntervals.size >= 3 &&
+                        qptIntervals.subList(qptIntervals.size - 3, qptIntervals.size)
+                            .all { (it.socTotalMw ?: 0.0) <= 0.001 }
+                    val history = qptIntervals.takeLast(MAX_HISTORY_POINTS)
+                    _state.update {
+                        it.copy(
+                            qptInstant = delta,
+                            qptSession = session,
+                            qptHistory = history,
+                            qptError = if (frozen) "QPT 硬件计数器未增长（当前固件可能未启用实时功耗遥测）" else null,
+                        )
                     }
                 }
+            }.onFailure { err ->
+                _state.update { it.copy(qptMonitoring = false, qptError = err.message ?: "读取硬件功耗失败") }
             }
         }
     }
 
     fun stopQptMonitor() {
         qptJob?.cancel()
-        qptJob = null
         if (_state.value.qptMonitoring) {
             _state.update { it.copy(qptMonitoring = false) }
         }
@@ -215,7 +246,78 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
     fun resetQptSession() {
         lastRawSample = null
         qptIntervals.clear()
-        _state.update { it.copy(qptInstant = null, qptSession = null, qptError = null) }
+        _state.update { it.copy(qptInstant = null, qptSession = null, qptHistory = emptyList(), qptError = null) }
+    }
+
+    fun startCpuStress(mode: CpuStressMode, seconds: Int) {
+        val current = _state.value
+        if (current.busy || cpuStressJob?.isActive == true) return
+        val hasQpt = current.snapshot?.systemProbe?.qptRails?.isNotEmpty() == true
+        val autoStartQpt = hasQpt && !current.qptMonitoring
+        if (autoStartQpt) {
+            startQptMonitorInternal()
+        }
+        val startIdx = qptIntervals.size
+        _state.update {
+            it.copy(
+                cpuStressRunning = true,
+                cpuStressStats = null,
+                cpuStressMessage = null,
+                cpuStressAvgPowerMw = null,
+                cpuStressAvgCpu0Mhz = null,
+                cpuStressAvgCpu1Mhz = null,
+            )
+        }
+        cpuStressJob = viewModelScope.launch {
+            try {
+                val stats = cpuStress.run(mode, seconds) { progress ->
+                    val window = qptWindowSummary(startIdx)
+                    _state.update {
+                        it.copy(
+                            cpuStressStats = progress,
+                            cpuStressAvgPowerMw = window?.avgCpuTotalMw ?: it.cpuStressAvgPowerMw,
+                            cpuStressAvgCpu0Mhz = window?.avgCpu0Mhz?.takeIf { m -> m > 0 } ?: it.cpuStressAvgCpu0Mhz,
+                            cpuStressAvgCpu1Mhz = window?.avgCpu1Mhz?.takeIf { m -> m > 0 } ?: it.cpuStressAvgCpu1Mhz,
+                        )
+                    }
+                }
+                val window = qptWindowSummary(startIdx)
+                val msg = if (stats.stoppedForThermal) {
+                    "设备热状态过高，已自动停止 CPU 压测"
+                } else {
+                    "CPU 压测完成：${stats.verifiedBlocks} 次校验全部通过"
+                }
+                _state.update {
+                    it.copy(
+                        cpuStressStats = stats,
+                        cpuStressMessage = msg,
+                        cpuStressAvgPowerMw = window?.avgCpuTotalMw ?: it.cpuStressAvgPowerMw,
+                        cpuStressAvgCpu0Mhz = window?.avgCpu0Mhz?.takeIf { m -> m > 0 } ?: it.cpuStressAvgCpu0Mhz,
+                        cpuStressAvgCpu1Mhz = window?.avgCpu1Mhz?.takeIf { m -> m > 0 } ?: it.cpuStressAvgCpu1Mhz,
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                _state.update { it.copy(cpuStressMessage = "CPU 压测已停止") }
+                throw cancelled
+            } catch (err: Exception) {
+                _state.update { it.copy(cpuStressMessage = err.message ?: "CPU 压测失败") }
+            } finally {
+                _state.update { it.copy(cpuStressRunning = false) }
+                if (autoStartQpt) {
+                    stopQptMonitor()
+                }
+            }
+        }
+    }
+
+    fun stopCpuStress() {
+        cpuStressJob?.cancel()
+    }
+
+    private fun qptWindowSummary(startIdx: Int): QptSessionStats? {
+        if (qptIntervals.size <= startIdx) return null
+        val slice = qptIntervals.subList(startIdx, qptIntervals.size).toList()
+        return QptPowerParser.summarizeSession(slice)
     }
 
     fun saveCurrentSetPowerRecord() {
@@ -259,9 +361,54 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
         }
     }
 
-    private fun persistPowerRecords(records: Map<Int, SavedSetPowerRecord>) {
+    private fun persistPowerPrefs(records: Map<Int, SavedSetPowerRecord>) {
         val serialized = QptPowerParser.serializeRecords(records)
         powerPrefs.edit().putString(KEY_RECORDS, serialized).apply()
+    }
+
+    private fun persistPowerRecords(records: Map<Int, SavedSetPowerRecord>) {
+        persistPowerPrefs(records)
+        viewModelScope.launch {
+            attempt { backend.writePowerRecords(records) }
+        }
+    }
+
+    fun updateAutoRestore(enabled: Boolean, targetSet: Int?) {
+        val current = _state.value
+        val snap = current.snapshot ?: return
+        if (!current.controlsEnabled) return
+        val resolvedTarget = targetSet?.takeIf { it in 2..7 }
+            ?: current.autoRestore?.config?.targetSet
+            ?: snap.sdamCpussIndex?.takeIf { it in 2..7 }
+            ?: snap.bootCpussIndex?.takeIf { it in 2..7 }
+            ?: 2
+        _state.update { it.copy(busyAction = if (enabled) "正在开启开机自动写入…" else "正在关闭开机自动写入…") }
+        viewModelScope.launch {
+            attempt {
+                backend.setAutoRestore(enabled, resolvedTarget, snap.bootId, snap.pdpCdbSha256)
+            }.onSuccess { cfg ->
+                _state.update { st ->
+                    val updatedSnapshot = st.autoRestore?.copy(config = cfg)
+                        ?: AutoRestoreSnapshot(moduleInstalled = true, config = cfg)
+                    st.copy(
+                        busyAction = null,
+                        autoRestore = updatedSnapshot,
+                        snackbarMessage = if (cfg.enabled) {
+                            "已开启开机自动写入：每次开机写入 Set ${cfg.targetSet}"
+                        } else {
+                            "已关闭开机自动写入"
+                        },
+                    )
+                }
+            }.onFailure { err ->
+                _state.update {
+                    it.copy(
+                        busyAction = null,
+                        snackbarMessage = err.message ?: "更新开机自动写入配置失败",
+                    )
+                }
+            }
+        }
     }
 
     fun toggleSetExpanded(setId: Int) {
@@ -307,15 +454,39 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
         }
         viewModelScope.launch {
             attempt {
-                backend.applySet(snap.bootId, target.setId, cpussIdx, globalIdx)
-            }.onSuccess { result ->
+                val result = backend.applySet(snap.bootId, target.setId, cpussIdx, globalIdx)
+                var syncNote = ""
+                var updatedAutoRestore = current.autoRestore
+                val arCfg = current.autoRestore?.config
+                if (arCfg?.enabled == true) {
+                    if (result.sdamCpussIndex == 1) {
+                        attempt {
+                            backend.setAutoRestore(false, arCfg.targetSet, snap.bootId, snap.pdpCdbSha256)
+                        }.onSuccess { nextCfg ->
+                            updatedAutoRestore = updatedAutoRestore.copy(config = nextCfg)
+                            syncNote = "（已同时关闭开机自动写入）"
+                        }
+                    } else if (result.sdamCpussIndex in 2..7 &&
+                        arCfg.pdpCdbSha256 != null &&
+                        arCfg.pdpCdbSha256 == snap.pdpCdbSha256
+                    ) {
+                        attempt {
+                            backend.setAutoRestore(true, result.sdamCpussIndex, snap.bootId, snap.pdpCdbSha256)
+                        }.onSuccess { nextCfg ->
+                            updatedAutoRestore = updatedAutoRestore?.copy(config = nextCfg)
+                            syncNote = "（开机自动写入已同步为 Set ${result.sdamCpussIndex}）"
+                        }
+                    }
+                }
+                Triple(result, updatedAutoRestore, syncNote)
+            }.onSuccess { (result, updatedAutoRestore, syncNote) ->
                 val updated = snap.copy(
                     bootSet = snap.bootSet.copy(stagedThisBootIndex = result.sdamCpussIndex),
                     sdamCpussIndex = result.sdamCpussIndex,
                     sdamGlobalIndex = result.sdamGlobalIndex,
                     reg7151Hex = result.reg7151Hex,
                 )
-                val message = if (updated.pendingReboot) {
+                val baseMsg = if (updated.pendingReboot) {
                     "已写入 Set ${result.sdamCpussIndex}，下次开机核对"
                 } else {
                     "SDAM 已读回 Set ${result.sdamCpussIndex}"
@@ -324,7 +495,8 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
                     it.copy(
                         busyAction = null,
                         snapshot = updated.copy(compatibility = CompatibilityChecker.evaluateSnapshot(updated)),
-                        snackbarMessage = message,
+                        autoRestore = updatedAutoRestore,
+                        snackbarMessage = baseMsg + syncNote,
                     )
                 }
             }.onFailure { err ->
@@ -362,6 +534,28 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
                         busyAction = null,
                         snackbarMessage = err.message ?: "采集基线失败",
                     )
+                }
+            }
+        }
+    }
+
+    fun exportDiagnosticZip(uri: Uri) {
+        val current = _state.value
+        val snap = current.snapshot ?: return
+        if (current.busy) return
+        _state.update { it.copy(busyAction = "正在导出诊断压缩包…") }
+        viewModelScope.launch {
+            val app = getApplication<Application>()
+            val appVersion = runCatching {
+                app.packageManager.getPackageInfo(app.packageName, 0).versionName ?: "未知"
+            }.getOrDefault("未知")
+            attempt {
+                DiagnosticExporter.exportZip(app, snap, current.autoRestore, appVersion, uri)
+            }.onSuccess {
+                _state.update { it.copy(busyAction = null, snackbarMessage = "已导出诊断压缩包") }
+            }.onFailure { err ->
+                _state.update {
+                    it.copy(busyAction = null, snackbarMessage = err.message ?: "导出诊断压缩包失败")
                 }
             }
         }
@@ -409,6 +603,7 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
     }
 
     override fun onCleared() {
+        stopCpuStress()
         stopQptMonitor()
         super.onCleared()
     }
@@ -424,8 +619,8 @@ internal class VoltSetViewModel(application: Application) : AndroidViewModel(app
     companion object {
         private const val PREFS_NAME = "voltset_power_records"
         private const val KEY_RECORDS = "records_v1"
-        private const val QPT_POLL_INTERVAL_MS = 1000L
         private const val MAX_QPT_SAMPLES = 600
+        private const val MAX_HISTORY_POINTS = 60
         private const val MIN_SAVE_SAMPLES = 3
     }
 }

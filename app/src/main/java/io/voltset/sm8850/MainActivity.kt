@@ -41,11 +41,15 @@ class MainActivity : ComponentActivity() {
                     onConfirmReboot = model::confirmReboot,
                     onDismissRebootConfirm = model::dismissRebootConfirm,
                     onCaptureBaseline = model::captureStockBaseline,
+                    onUpdateAutoRestore = model::updateAutoRestore,
                     onToggleQptMonitor = model::toggleQptMonitor,
                     onResetQptSession = model::resetQptSession,
                     onSavePowerRecord = model::saveCurrentSetPowerRecord,
                     onDeletePowerRecord = model::deletePowerRecord,
                     onClearPowerRecords = model::clearPowerRecords,
+                    onStartCpuStress = model::startCpuStress,
+                    onStopCpuStress = model::stopCpuStress,
+                    onExportDiagnosticZip = model::exportDiagnosticZip,
                     onShowMessage = model::showMessage,
                     onConsumeSnackbar = model::consumeSnackbar,
                 )
@@ -55,10 +59,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        model.refresh()
+        model.refreshOnResume()
     }
 
     override fun onStop() {
+        model.stopCpuStress()
         model.stopQptMonitor()
         gpuModel.stopStress()
         super.onStop()

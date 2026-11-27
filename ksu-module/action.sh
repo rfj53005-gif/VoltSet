@@ -50,19 +50,27 @@ echo "=== VoltSet 状态摘要（只读） ==="
 
 auto_en=0
 auto_target=
+auto_fingerprint=
 if [ -r "$CONF" ]; then
     while IFS='=' read -r k v; do
         case "$k" in
-            enabled) auto_en=$(printf '%s' "$v" | tr -cd '0-9') ;;
-            target_set) auto_target=$(printf '%s' "$v" | tr -cd '0-9') ;;
+            enabled) auto_en=$v ;;
+            target_set) auto_target=$v ;;
+            pdp_cdb_sha256) auto_fingerprint=$v ;;
         esac
     done < "$CONF"
 fi
-if [ "$auto_en" = 1 ] && [ -n "$auto_target" ]; then
-    printf '开机自动写 Set: 已开启 (目标 Set %s)\n' "$auto_target"
-else
-    printf '开机自动写 Set: 已关闭\n'
-fi
+case "$auto_fingerprint" in *[!0-9a-f]*) auto_fingerprint= ;; esac
+case "$auto_en:$auto_target" in
+    1:[2-7])
+        if [ "${#auto_fingerprint}" = 64 ]; then
+            printf '开机自动写 Set: 已开启 (目标 Set %s)\n' "$auto_target"
+        else
+            printf '开机自动写 Set: 待确认 (目标 Set %s，缺少固件指纹)\n' "$auto_target"
+        fi
+        ;;
+    *) printf '开机自动写 Set: 已关闭\n' ;;
+esac
 
 if [ -r "$STATUS" ]; then
     last_time=$(awk -F= '$1 == "time" { print $2; exit }' "$STATUS" 2>/dev/null || true)

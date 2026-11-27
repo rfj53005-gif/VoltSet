@@ -8,6 +8,7 @@ import io.voltset.sm8850.core.GpuVendorBoot
 import io.voltset.sm8850.core.GpuVoltageCorners
 import java.io.File
 import java.io.RandomAccessFile
+import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.runInterruptible
@@ -20,42 +21,66 @@ internal data class GpuImageSource(
     val dtbIndex: Int,
     val imageSize: Long,
     val bootId: String,
-) {
-    val partition: String get() = "/dev/block/by-name/vendor_boot$slot"
-}
+    val partition: String,
+)
 
 internal data class GpuSnapshot(
     val source: GpuImageSource,
     val image: GpuVendorBoot,
     val activeBin: Int?,
     val runtimeAcd: Boolean?,
-    val stockVoltages: Map<Long?, Map<Long, Long>>,
+    val voltageReference: GpuVoltageReference?,
     val voltageCorners: GpuVoltageCorners?,
+    val hasAvbFooter: Boolean = false,
+    val dtboPresent: Boolean = false,
 ) {
     fun sameSource(other: GpuSnapshot): Boolean =
         source == other.source && image.sameSource(other.image)
 }
 
+internal data class GpuExportResult(
+    val sha256Hex: String,
+    val sizeBytes: Long,
+    val slot: String,
+    val partitionName: String,
+    val isStockBackup: Boolean = false,
+)
+
 internal class GpuBackend(private val context: Context) {
+    private val backend = RootBackend(context)
+
     private data class DeviceInfo(
         val source: GpuImageSource,
         val availableFrequencies: Set<Long>,
         val runtimeAcd: Boolean?,
         val voltageCorners: GpuVoltageCorners?,
+        val socModel: String,
+        val socId: Int?,
+        val dtboPresent: Boolean,
     )
 
     suspend fun readCurrent(): GpuSnapshot {
-        val source = readDeviceInfo().source
+        val info = readDeviceInfo()
+        val source = info.source
         val header = readRange(source, 0, GpuVendorBoot.HEADER_BYTES.toLong()) { it.readBytes() }
         val layout = GpuVendorBoot.layout(header, source.imageSize)
         val region = readRange(source, layout.dtbOffset, layout.dtbSize.toLong()) { it.readBytes() }
-        val factory = GpuFactoryReference.forSource(source)
-        val image = GpuVendorBoot.read(header, source.imageSize, region, source.dtbIndex, factory?.acd.orEmpty())
+        val hasAvbFooter = if (source.imageSize >= 64L) {
+            runCatching {
+                readRange(source, source.imageSize - 64L, 64L) { file ->
+                    val tail = file.readBytes()
+                    tail.size >= 4 && tail[0] == 'A'.code.toByte() && tail[1] == 'V'.code.toByte() &&
+                        tail[2] == 'B'.code.toByte() && tail[3] == 'f'.code.toByte()
+                }
+            }.getOrDefault(false)
+        } else false
+        val image = GpuVendorBoot.read(header, source.imageSize, region, source.dtbIndex, GpuFactoryReference.acdForSource(source))
         val current = readDeviceInfo(includeVoltageCorners = true)
         check(current.source == source) { "读取期间启动状态发生变化，请重新读取" }
+        val reference = GpuFactoryReference.voltageForSoc(current.socModel, current.socId)
         return GpuSnapshot(
             source, image, image.matchRuntimeBin(current.availableFrequencies), current.runtimeAcd,
-            factory?.voltages.orEmpty(), current.voltageCorners,
+            reference, current.voltageCorners, hasAvbFooter = hasAvbFooter, dtboPresent = current.dtboPresent,
         )
     }
 
@@ -64,21 +89,65 @@ internal class GpuBackend(private val context: Context) {
         snapshot: GpuSnapshot,
         draft: GpuDraft,
         uri: Uri,
-    ) = newDocument(uri) {
+    ): GpuExportResult = exportPartitionImage(snapshot, draft, uri, isStockBackup = false)
+
+    suspend fun exportStockBackup(
+        snapshot: GpuSnapshot,
+        uri: Uri,
+    ): GpuExportResult = exportPartitionImage(snapshot, null, uri, isStockBackup = true)
+
+    private suspend fun exportPartitionImage(
+        snapshot: GpuSnapshot,
+        draft: GpuDraft?,
+        uri: Uri,
+        isStockBackup: Boolean,
+    ): GpuExportResult {
+        var result: GpuExportResult? = null
+        newDocument(uri) {
             val source = snapshot.source
+            val requiredBytes = source.imageSize + 16L * 1024L * 1024L
+            val usableBytes = context.cacheDir.usableSpace
+            check(usableBytes >= requiredBytes) {
+                val needMb = (requiredBytes + 1024 * 1024 - 1) / (1024 * 1024)
+                val availMb = usableBytes / (1024 * 1024)
+                "应用缓存剩余空间不足（需要至少 ${needMb} MB，当前可用 ${availMb} MB）"
+            }
             check(readDeviceInfo().source == source) { "启动槽位或版本已变化，请重新读取" }
             readRange(source, 0, source.imageSize, timeoutSeconds = 90) { staged ->
                 check(readDeviceInfo().source == source) { "导出期间启动状态发生变化，请重新读取" }
-                RandomAccessFile(staged, "rw").use { snapshot.image.patchCopy(it, draft) }
+                if (draft != null) {
+                    RandomAccessFile(staged, "rw").use { snapshot.image.patchCopy(it, draft) }
+                }
+                val digest = MessageDigest.getInstance("SHA-256")
                 runInterruptible {
                     val resolver = context.contentResolver
                     val output = resolver.openOutputStream(uri, "w") ?: error("无法打开导出文件")
                     output.use { sink ->
-                        val written = staged.inputStream().use { it.copyTo(sink, bufferSize = 256 * 1024) }
+                        val buffer = ByteArray(256 * 1024)
+                        var written = 0L
+                        staged.inputStream().use { input ->
+                            while (true) {
+                                val n = input.read(buffer)
+                                if (n < 0) break
+                                digest.update(buffer, 0, n)
+                                sink.write(buffer, 0, n)
+                                written += n
+                            }
+                        }
                         check(written == source.imageSize) { "导出的镜像不完整" }
                     }
                 }
+                val hex = digest.digest().joinToString("") { "%02x".format(it) }
+                result = GpuExportResult(
+                    sha256Hex = hex,
+                    sizeBytes = source.imageSize,
+                    slot = source.slot,
+                    partitionName = "vendor_boot${source.slot}",
+                    isStockBackup = isStockBackup,
+                )
             }
+        }
+        return checkNotNull(result)
     }
 
     suspend fun exportConfig(snapshot: GpuSnapshot, draft: GpuDraft, uri: Uri) = newDocument(uri) {
@@ -109,68 +178,34 @@ internal class GpuBackend(private val context: Context) {
     }
 
     private suspend fun readDeviceInfo(includeVoltageCorners: Boolean = false): DeviceInfo {
-        val voltageProbe = if (includeVoltageCorners) """
-            for debug_dir in /sys/kernel/debug ${'$'}(awk '$3 == "debugfs" { print $2 }' /proc/mounts); do
-                db="${'$'}debug_dir/cmd-db"
-                [ -r "${'$'}db" ] || continue
-                gfx="${'$'}(awk '$2 == "gfx.lvl" { print "gfx=" $0 }' "${'$'}db" 2>/dev/null)" || continue
-                [ -n "${'$'}gfx" ] || continue
-                printf '%s\n' "${'$'}gfx"
-                break
-            done
-        """.trimIndent() else ""
-        val script = """
-            set -eu
-            export PATH=/system/bin
-            slot="${'$'}(getprop ro.boot.slot_suffix)"
-            case "${'$'}slot" in
-                _a|_b) ;;
-                *) echo "无法识别当前 A/B 启动槽位" >&2; exit 1 ;;
-            esac
-            source="/dev/block/by-name/vendor_boot${'$'}slot"
-            test -b "${'$'}source" || { echo "找不到当前槽位的 vendor_boot" >&2; exit 1; }
-            printf 'slot=%s\n' "${'$'}slot"
-            printf 'device=%s\n' "${'$'}(getprop ro.product.device)"
-            printf 'build=%s\n' "${'$'}(getprop ro.build.version.incremental)"
-            printf 'index=%s\n' "${'$'}(getprop ro.boot.dtb_idx)"
-            printf 'boot=%s\n' "${'$'}(cat /proc/sys/kernel/random/boot_id)"
-            bytes="${'$'}(toybox blockdev --getsize64 "${'$'}source")"
-            printf 'bytes=%s\n' "${'$'}bytes"
-            for file in /sys/class/kgsl/kgsl-3d0/gpu_available_frequencies /sys/class/kgsl/kgsl-3d0/devfreq/available_frequencies; do
-                if [ -r "${'$'}file" ]; then
-                    printf 'frequencies=%s\n' "${'$'}(cat "${'$'}file")"
-                    break
-                fi
-            done
-            if acd="${'$'}(cat /sys/class/kgsl/kgsl-3d0/acd 2>/dev/null)"; then
-                printf 'acd=%s\n' "${'$'}acd"
-            fi
-            $voltageProbe
-        """.trimIndent()
-        return readRoot(listOf("/system/bin/sh", "-c", script)) { output ->
-            check(output.length() <= 16 * 1024) { "GPU 设备信息超出预期" }
-            val lines = output.readLines()
-            val fields = lines.filter { '=' in it }
-                .associate { it.substringBefore('=') to it.substringAfter('=').trim() }
-            val device = fields["device"]?.takeIf { it.isNotEmpty() } ?: error("无法识别当前机型")
-            val build = fields["build"]?.takeIf { it.isNotEmpty() } ?: error("无法识别当前系统版本")
-            val slot = fields["slot"]?.takeIf { it == "_a" || it == "_b" } ?: error("启动槽位无效")
-            val dtbIndex = fields["index"]?.toIntOrNull()?.takeIf { it >= 0 }
-                ?: error("系统没有报告可用的 DTB 索引")
-            val bootId = fields["boot"]?.takeIf { it.isNotEmpty() } ?: error("无法确认当前开机记录")
-            val imageSize = fields["bytes"]?.toLongOrNull()?.takeIf { it >= GpuVendorBoot.HEADER_BYTES }
-                ?: error("无法读取 vendor_boot 分区大小")
-            val frequencies = fields["frequencies"].orEmpty().split(Regex("\\s+"))
-                .mapNotNull { it.toLongOrNull()?.takeIf { value -> value > 0 } }.toSet()
-            val runtimeAcd = when (fields["acd"]) {
-                "1" -> true
-                "0" -> false
-                else -> null
-            }
-            val voltageCorners = lines.singleOrNull { it.startsWith("gfx=") }
-                ?.let { GpuVoltageCorners.parse(it.substringAfter('=')) }
-            DeviceInfo(GpuImageSource(device, build, slot, dtbIndex, imageSize, bootId), frequencies, runtimeAcd, voltageCorners)
+        val output = backend.readGpuInfo(includeVoltageCorners)
+        val lines = output.lines()
+        val fields = lines.filter { '=' in it }
+            .associate { it.substringBefore('=') to it.substringAfter('=').trim() }
+        val device = fields["device"]?.takeIf { it.isNotEmpty() } ?: error("无法识别当前机型")
+        val build = fields["build"]?.takeIf { it.isNotEmpty() } ?: error("无法识别当前系统版本")
+        val slot = fields["slot"]?.takeIf { it == "_a" || it == "_b" } ?: error("启动槽位无效")
+        val partition = fields["source"]?.takeIf { it.startsWith("/dev/block/") }
+            ?: error("找不到当前槽位的 vendor_boot")
+        val dtbIndex = fields["index"]?.toIntOrNull()?.takeIf { it >= 0 }
+            ?: error("系统没有报告可用的 DTB 索引")
+        val bootId = fields["boot"]?.takeIf { it.isNotEmpty() } ?: error("无法确认当前开机记录")
+        val imageSize = fields["bytes"]?.toLongOrNull()?.takeIf { it >= GpuVendorBoot.HEADER_BYTES }
+            ?: error("无法读取 vendor_boot 分区大小")
+        val frequencies = fields["frequencies"].orEmpty().split(Regex("\\s+"))
+            .mapNotNull { it.toLongOrNull()?.takeIf { value -> value > 0 } }.toSet()
+        val runtimeAcd = when (fields["acd"]) {
+            "1" -> true
+            "0" -> false
+            else -> null
         }
+        val voltageCorners = lines.singleOrNull { it.startsWith("gfx=") }
+            ?.let { GpuVoltageCorners.parse(it.substringAfter('=')) }
+        return DeviceInfo(
+            GpuImageSource(device, build, slot, dtbIndex, imageSize, bootId, partition), frequencies, runtimeAcd, voltageCorners,
+            fields["soc_model"].orEmpty(), fields["soc_id"]?.toIntOrNull(),
+            dtboPresent = fields["dtbo_present"] == "1",
+        )
     }
 
     private suspend fun <T> readRange(

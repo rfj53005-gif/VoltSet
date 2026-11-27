@@ -1,9 +1,11 @@
 package io.voltset.sm8850
 
 import android.content.Context
-import android.os.SystemClock
 import android.util.Base64
 import io.voltset.sm8850.core.AdjBackend
+import io.voltset.sm8850.core.AutoRestoreConfig
+import io.voltset.sm8850.core.AutoRestoreParser
+import io.voltset.sm8850.core.AutoRestoreSnapshot
 import io.voltset.sm8850.core.BaselineSource
 import io.voltset.sm8850.core.BootSetStatus
 import io.voltset.sm8850.core.CdtInspector
@@ -17,6 +19,7 @@ import io.voltset.sm8850.core.PdpFirmwareParser
 import io.voltset.sm8850.core.PdpHardwareLimits
 import io.voltset.sm8850.core.QptPowerParser
 import io.voltset.sm8850.core.QptRawSample
+import io.voltset.sm8850.core.SavedSetPowerRecord
 import io.voltset.sm8850.core.ScmiDataSource
 import io.voltset.sm8850.core.ScmiPlanParser
 import io.voltset.sm8850.core.ScmiQualityReport
@@ -25,14 +28,60 @@ import io.voltset.sm8850.core.VoltageSetEstimator
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
+import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPInputStream
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 internal class RootBackend(private val context: Context) {
     private val bundle: File by lazy {
-        File(context.filesDir, "backend").also { dir ->
-            installAssets("backend", dir)
+        File(context.filesDir, ASSET_ROOT).also { dir ->
+            synchronized(bundleInstallLock) { installBundle(dir) }
+        }
+    }
+
+    // Redeploy the bundle only when the APK identity or the deployed tree changed.
+    private fun installBundle(directory: File) {
+        val identity = installStamp()
+        val stored = runCatching { File(directory, INSTALL_STAMP).readText().trimEnd() }.getOrNull()
+        if (stored?.startsWith("$identity\n") == true && stored == bundleStamp(directory, identity)) return
+        installAssets(ASSET_ROOT, directory)
+        writeInstallStamp(directory, bundleStamp(directory, identity))
+    }
+
+    // Any reinstall changes lastUpdateTime, so stale binaries get replaced once.
+    private fun installStamp(): String {
+        val info = context.packageManager.getPackageInfo(context.packageName, 0)
+        return "format=2\nversionCode=${info.longVersionCode}\nlastUpdateTime=${info.lastUpdateTime}"
+    }
+
+    // Validate the deployed tree without reopening or decompressing APK assets on a cache hit.
+    private fun bundleStamp(directory: File, identity: String): String =
+        directory.walkTopDown()
+            .drop(1)
+            .filter { it != File(directory, INSTALL_STAMP) }
+            .map {
+                val path = it.relativeTo(directory).invariantSeparatorsPath
+                if (it.isDirectory) "dir $path" else "file $path ${it.length()} ${it.lastModified()}"
+            }
+            .sorted()
+            .joinToString(separator = "\n", prefix = "$identity\n")
+
+    private fun writeInstallStamp(directory: File, stamp: String) {
+        val tmp = File.createTempFile("voltset-stamp-", ".tmp", directory)
+        try {
+            tmp.writeText(stamp + "\n")
+            val target = File(directory, INSTALL_STAMP)
+            check(tmp.renameTo(target)) { "无法写入 Root 后端安装戳" }
+        } finally {
+            tmp.delete()
         }
     }
 
@@ -46,9 +95,11 @@ internal class RootBackend(private val context: Context) {
 
         val assets = context.assets
         val names = checkNotNull(assets.list(assetPath)).toSet()
+        // Stale install stamp is not an asset, so the cleanup below drops it
+        // before the copy and the new one is written afterwards.
         directory.listFiles()?.forEach { existing ->
             if (existing.name !in names) {
-                existing.deleteRecursively()
+                check(existing.deleteRecursively()) { "无法清理旧后端文件: ${existing.name}" }
             }
         }
 
@@ -60,10 +111,14 @@ internal class RootBackend(private val context: Context) {
                 installAssets(childAsset, destination)
                 continue
             }
+            if (destination.isDirectory) {
+                check(destination.deleteRecursively()) { "无法清理同名旧目录: $childAsset" }
+            }
             val tmp = File.createTempFile("voltset-", ".tmp", directory)
             try {
                 assets.open(childAsset).use { input ->
-                    tmp.outputStream().use { output -> input.copyTo(output) }
+                    val bytes = tmp.outputStream().use { output -> input.copyTo(output) }
+                    check(bytes > 0) { "Root 后端文件为空: $childAsset" }
                 }
                 check(tmp.renameTo(destination)) { "无法部署 Root 后端文件: $childAsset" }
             } finally {
@@ -74,6 +129,16 @@ internal class RootBackend(private val context: Context) {
 
     suspend fun readStatus(): DeviceSnapshot = withContext(Dispatchers.IO) {
         parseStatusOutput(execute(listOf("status")))
+    }
+
+    suspend fun hasSameReadback(snapshot: DeviceSnapshot): Boolean {
+        val current = BackendOutput(execute(listOf("quick_status"), 16 * 1024)).values
+        return current["BOOT_ID"] == snapshot.bootId &&
+            current["ADJ_BACKEND"] == snapshot.adjBackend.name.lowercase() &&
+            current["ADJ_AVAILABLE"] == (if (snapshot.adjAvailable) "1" else "0") &&
+            current["ADJ_SET_NODE"] == (if (snapshot.adjSetNodePresent) "1" else "0") &&
+            current["SDAM_CPUSS_IDX"]?.toIntOrNull() == snapshot.sdamCpussIndex &&
+            current["SDAM_GLOBAL_IDX"]?.toIntOrNull() == snapshot.sdamGlobalIndex
     }
 
     suspend fun applySet(
@@ -111,26 +176,87 @@ internal class RootBackend(private val context: Context) {
         execute(listOf("reboot", bootId, expectedCpussIndex.toString(), globalIndex.toString()))
     }
 
-    suspend fun enableQptIfNeeded(): Boolean {
-        val output = execute(listOf("power_enable"))
-        return BackendOutput(output).values["QPT_CHANGED"] == "1"
+    fun streamPowerSamples(): Flow<QptRawSample> = callbackFlow {
+        val process = startRootProcess(backendArguments(listOf("power_stream"))) { redirectErrorStream(true) }
+        try {
+            launch {
+                try {
+                    var lastError: String? = null
+                    process.inputStream.bufferedReader().use { reader ->
+                        while (true) {
+                            val line = reader.readLine() ?: break
+                            val sample = QptPowerParser.parseStreamFrame(line)
+                            if (sample != null) send(sample)
+                            else if (line.startsWith("ERROR ")) lastError = line.removePrefix("ERROR ")
+                        }
+                    }
+                    close(IllegalStateException(lastError ?: "QPT 采样已中断，请检查 Root 授权后重试"))
+                } catch (error: IOException) {
+                    close(error)
+                }
+            }
+            awaitClose()
+        } finally {
+            withContext(NonCancellable) {
+                // Closing stdin tells the sampler to restore the QPT state and exit.
+                runCatching { process.outputStream.close() }
+                if (!process.waitFor(1500, TimeUnit.MILLISECONDS)) {
+                    process.destroy()
+                    if (!process.waitFor(1500, TimeUnit.MILLISECONDS)) process.destroyForcibly()
+                }
+            }
+        }
+    }.flowOn(Dispatchers.IO)
+
+    suspend fun readGpuInfo(includeVoltageCorners: Boolean): String =
+        execute(listOf("gpu_info", if (includeVoltageCorners) "1" else "0"), 16 * 1024)
+
+    suspend fun readPowerRecords(): Map<Int, SavedSetPowerRecord> {
+        val reply = BackendOutput(execute(listOf("read_power_records"), 64 * 1024))
+        return QptPowerParser.deserializeRecords(reply.blocks["POWER_RECORDS"])
     }
 
-    suspend fun disableQpt() {
-        execute(listOf("power_disable"))
+    suspend fun writePowerRecords(records: Map<Int, SavedSetPowerRecord>) {
+        val csv = QptPowerParser.serializeRecords(records)
+        val b64 = if (csv.isEmpty()) "" else Base64.encodeToString(csv.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+        execute(listOf("write_power_records", b64), 16 * 1024)
     }
 
-    suspend fun readPowerSample(): QptRawSample {
-        val output = execute(listOf("power_sample"))
-        return QptPowerParser.parseSample(output, SystemClock.elapsedRealtimeNanos())
+    suspend fun readAutoRestore(): AutoRestoreSnapshot {
+        val reply = BackendOutput(execute(listOf("read_auto_restore"), 32 * 1024))
+        return AutoRestoreSnapshot(
+            moduleInstalled = reply.values["KSU_MODULE_INSTALLED"] == "1",
+            config = AutoRestoreParser.parseConfig(reply.blocks["AUTO_RESTORE_CONF"]),
+            status = AutoRestoreParser.parseStatus(reply.blocks["AUTO_RESTORE_STATUS"]),
+        )
     }
 
-    private suspend fun execute(args: List<String>): String = withContext(Dispatchers.IO) {
-        val command = listOf(
-            "/system/bin/sh", File(bundle, "voltset.sh").path, bundle.path,
-        ) + args
-        runRootCommand(context.cacheDir, command) { outputFile, exitCode, _ ->
-            check(outputFile.length() <= MAX_BACKEND_OUTPUT_BYTES) { "Root 后端返回的数据超出预期" }
+    suspend fun setAutoRestore(
+        enabled: Boolean,
+        targetSet: Int?,
+        bootId: String?,
+        pdpCdbSha256: String?,
+    ): AutoRestoreConfig {
+        val cleanTarget = targetSet?.takeIf { it in 2..7 }
+        if (enabled) {
+            val validBoot = requireNotNull(bootId) { "缺少启动 ID，请刷新后重试" }
+            val validHash = AutoRestoreParser.parsePdpCdbFingerprint(pdpCdbSha256)
+                ?: error("缺少有效的 pdp_cdb 指纹，请刷新后重试")
+            val chosen = cleanTarget ?: error("目标档位必须为 Set 2..7")
+            execute(listOf("set_auto_restore", "1", chosen.toString(), validBoot, validHash), 16 * 1024)
+            return AutoRestoreConfig(enabled = true, targetSet = chosen, pdpCdbSha256 = validHash)
+        } else {
+            execute(listOf("set_auto_restore", "0", cleanTarget?.toString().orEmpty()), 16 * 1024)
+            return AutoRestoreConfig(enabled = false, targetSet = cleanTarget, pdpCdbSha256 = null)
+        }
+    }
+
+    private suspend fun execute(
+        args: List<String>,
+        maxOutputBytes: Int = MAX_BACKEND_OUTPUT_BYTES,
+    ): String = withContext(Dispatchers.IO) {
+        runRootCommand(context.cacheDir, backendArguments(args)) { outputFile, exitCode, _ ->
+            check(outputFile.length() <= maxOutputBytes) { "Root 后端返回的数据超出预期" }
             val output = outputFile.readText()
             if (exitCode != 0) {
                 val errors = output.lineSequence()
@@ -148,6 +274,9 @@ internal class RootBackend(private val context: Context) {
             output
         }
     }
+
+    private fun backendArguments(args: List<String>): List<String> =
+        listOf("/system/bin/sh", File(bundle, "voltset.sh").path, bundle.path) + args
 
     private fun parseStatusOutput(output: String): DeviceSnapshot {
         val reply = BackendOutput(output)
@@ -178,6 +307,7 @@ internal class RootBackend(private val context: Context) {
         val sdamGlobalIndex = kv["SDAM_GLOBAL_IDX"]?.toIntOrNull()
         val reg7151Hex = kv["REG_7151"]?.takeIf { it.isNotBlank() && it != "unavailable" }
         val pdpCdbPath = kv["PDP_CDB_PATH"]?.takeIf { it != "none" }
+        val pdpCdbSha256 = AutoRestoreParser.parsePdpCdbFingerprint(kv["PDP_CDB_SHA256"])
 
         var pdpCdb: PdpCdbData? = null
         var pdpCdbError = kv["PDP_CDB_ERROR"]
@@ -320,6 +450,7 @@ internal class RootBackend(private val context: Context) {
             sdamGlobalIndex = sdamGlobalIndex,
             reg7151Hex = reg7151Hex,
             pdpCdbPath = pdpCdbPath,
+            pdpCdbSha256 = pdpCdbSha256,
             pdpCdb = pdpCdb,
             pdpCdbError = pdpCdbError,
             pdpFwPath = pdpFwPath,
@@ -390,12 +521,18 @@ internal class RootBackend(private val context: Context) {
             }
         }
         val rawB64 = reply.blocks[rawKey] ?: return null
-        return Base64.decode(rawB64, Base64.DEFAULT)
+        return Base64.decode(rawB64, Base64.DEFAULT).also {
+            check(it.size <= MAX_PARTITION_BYTES) { "分区数据超出上限 ($MAX_PARTITION_BYTES B)" }
+        }
     }
 
 
     companion object {
-        private const val MAX_BACKEND_OUTPUT_BYTES = 4 * 1024 * 1024
+        private const val ASSET_ROOT = "backend"
+        private const val INSTALL_STAMP = ".install-stamp"
+        // Two 4 MiB partitions may be returned as raw base64, plus diagnostic metadata.
+        private const val MAX_BACKEND_OUTPUT_BYTES = 12 * 1024 * 1024
         private const val MAX_PARTITION_BYTES = 4 * 1024 * 1024
+        private val bundleInstallLock = Any()
     }
 }

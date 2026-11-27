@@ -1,0 +1,47 @@
+name: VoltSet CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check shell script syntax
+        run: |
+          sh -n app/src/main/assets/backend/voltset.sh
+          sh -n ksu-module/boot-completed.sh
+          sh -n ksu-module/action.sh
+          sh -n ksu-module/customize.sh
+          sh -n ksu-module/uninstall.sh
+          bash -n scripts/build-ksu-module.sh
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run KSU WebUI & backend unit tests
+        run: node --test ksu-module/test/core.test.mjs ksu-module/test/backend.test.mjs
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Run Android unit tests and release lint
+        run: ./gradlew :app:testDebugUnitTest :app:lintRelease --console=plain
+
+      - name: Package KernelSU WebUI module
+        run: |
+          ./scripts/build-ksu-module.sh
+          ls -lh build/ksu/VoltSet-KSU-v*.zip

@@ -1,5 +1,6 @@
 package io.voltset.sm8850.ui
 
+import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -37,6 +38,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import io.voltset.sm8850.CpuStressMode
 import io.voltset.sm8850.GpuEditorState
 import io.voltset.sm8850.GpuEditorViewModel
 import io.voltset.sm8850.R
@@ -61,11 +63,15 @@ internal fun VoltSetApp(
     onConfirmReboot: () -> Unit,
     onDismissRebootConfirm: () -> Unit,
     onCaptureBaseline: () -> Unit,
+    onUpdateAutoRestore: (Boolean, Int?) -> Unit,
     onToggleQptMonitor: () -> Unit,
     onResetQptSession: () -> Unit,
     onSavePowerRecord: () -> Unit,
     onDeletePowerRecord: (Int) -> Unit,
     onClearPowerRecords: () -> Unit,
+    onStartCpuStress: (CpuStressMode, Int) -> Unit,
+    onStopCpuStress: () -> Unit,
+    onExportDiagnosticZip: (Uri) -> Unit,
     onShowMessage: (String) -> Unit,
     onConsumeSnackbar: () -> Unit,
 ) {
@@ -80,6 +86,12 @@ internal fun VoltSetApp(
     }
     val gpuImageOutput = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
         uri?.let(gpuModel::exportImage)
+    }
+    val gpuBackupOutput = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        uri?.let(gpuModel::exportStockBackup)
+    }
+    val diagZipOutput = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        uri?.let(onExportDiagnosticZip)
     }
 
     LaunchedEffect(state.snackbarMessage) {
@@ -190,6 +202,7 @@ internal fun VoltSetApp(
                     onPickConfig = { gpuConfigInput.launch(arrayOf("application/json", "text/plain", "application/octet-stream", "application/gzip")) },
                     onSaveConfig = { gpuConfigOutput.launch(it) },
                     onSaveImage = { gpuImageOutput.launch(it) },
+                    onSaveStockBackup = { gpuBackupOutput.launch(it) },
                     modifier = Modifier.fillMaxSize().padding(innerPadding),
                 )
             }
@@ -263,6 +276,7 @@ internal fun VoltSetApp(
                                 onResetDefault = onRequestResetDefault,
                                 onReboot = onRequestReboot,
                                 onToggleExpanded = onToggleExpanded,
+                                onUpdateAutoRestore = onUpdateAutoRestore,
                                 onOpenCompatTab = { onSelectTab(VoltSetTab.COMPAT) },
                             )
                             VoltSetTab.VOLTAGE -> VoltageScreen(
@@ -275,12 +289,18 @@ internal fun VoltSetApp(
                                 onSavePowerRecord = onSavePowerRecord,
                                 onDeletePowerRecord = onDeletePowerRecord,
                                 onClearPowerRecords = onClearPowerRecords,
+                                onStartCpuStress = onStartCpuStress,
+                                onStopCpuStress = onStopCpuStress,
                                 onShowMessage = onShowMessage,
                             )
                             VoltSetTab.COMPAT -> CompatibilityScreen(
                                 state = state,
                                 snapshot = snap,
                                 onRefresh = onRefresh,
+                                onExportDiagnosticZip = {
+                                    val device = snap.deviceName.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                                    diagZipOutput.launch("VoltSet-diag-$device.zip")
+                                },
                                 onShowMessage = onShowMessage,
                             )
                             VoltSetTab.GPU -> Unit

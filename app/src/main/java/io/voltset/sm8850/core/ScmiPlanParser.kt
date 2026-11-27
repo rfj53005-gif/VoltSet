@@ -108,7 +108,7 @@ object ScmiPlanParser {
                 baselineMv = base?.voltageMv,
                 deltaMv = base?.takeIf { point.exactFormulaMatch && it.exactFormulaMatch }
                     ?.let { point.voltageMv - it.voltageMv },
-                expectedCdbCxMv = activeSet?.predictedCxOffsetForFreq(point.domain, point.freqKhz),
+                expectedCdbCxMv = activeSet?.predictedCxOffsetForBin(point.domain, point.freqKhz, point.levelIndex),
             )
         }
     }

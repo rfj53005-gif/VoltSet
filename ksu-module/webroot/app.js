@@ -2,7 +2,7 @@
   'use strict';
 
   const C = window.VoltSetCore;
-  const APP_VERSION = 'v0.5.4 (KSU WebUI)';
+  const APP_VERSION = 'v0.6.0 (KSU WebUI)';
   const RESOLVE_BUNDLE =
     'MOD=/data/adb/modules/voltset; [ -r "$MOD/backend/voltset.sh" ] || MOD=/data/adb/modules_update/voltset; BUNDLE="$MOD/backend"; SH="$BUNDLE/voltset.sh"';
   const POWER_RECORDS_FILE = '/data/adb/voltset/persistent/power-records.csv';
@@ -10,6 +10,7 @@
   const AUTO_RESTORE_STATUS = '/data/adb/voltset/persistent/auto-restore.status';
   const LOCAL_STORAGE_KEY = 'voltset_ksu_power_records_v1';
   const CHUNK_SIZE = 65536;
+  const MAX_STATUS_BASE64_BYTES = 16 * 1024 * 1024;
 
   const state = {
     tab: 'sets',
@@ -19,23 +20,21 @@
     snapshot: null,
     clusterFilter: null,
     expandedSets: new Set(),
-    autoRestore: { enabled: false, targetSet: null },
+    autoRestore: C.parseAutoRestoreConfig(''),
     autoRestoreStatus: null,
     qptMonitoring: false,
     qptInstant: null,
     qptSession: null,
     qptError: null,
     savedPowerRecords: {},
-    qptTurnedOnBySelf: false,
-    qptTimer: null,
     qptLastSample: null,
     qptIntervals: [],
     qptZeroStreak: 0,
-    qptPollingInFlight: false,
   };
 
   let execSeq = 0;
   let toastTimer = null;
+  let qptTask = null;
 
   function esc(str) {
     return String(str === undefined || str === null ? '' : str)
@@ -102,33 +101,44 @@
   }
 
   async function runBackendStatusChunked() {
-    const tmpTxt = '/data/adb/voltset/session/webui-status.txt';
-    const tmpB64 = '/data/adb/voltset/session/webui-status.b64';
+    // The backend resets session/ on a new boot. Each request owns a separate directory outside it.
+    const dirRes = await ksuExec(
+      'umask 077; mkdir -p /data/adb/voltset && mktemp -d /data/adb/voltset/webui-status.XXXXXXXX',
+      5000
+    );
+    const dir = dirRes.stdout.trim();
+    if (dirRes.errno !== 0 || !/^\/data\/adb\/voltset\/webui-status\.[a-zA-Z0-9]{8}$/.test(dir)) {
+      throw new Error('无法创建 WebUI 状态临时目录');
+    }
+    const tmpTxt = `${dir}/status.txt`;
+    const tmpB64 = `${dir}/status.b64`;
     const prepCmd =
       `${RESOLVE_BUNDLE}; [ -r "$SH" ] || { echo "ERROR 未找到后端脚本 $SH" >&2; exit 1; }; ` +
-      `mkdir -p /data/adb/voltset/session && ` +
-      `if ! /system/bin/sh "$SH" "$BUNDLE" status > '${tmpTxt}'; then rm -f '${tmpTxt}'; exit 1; fi; ` +
-      `base64 < '${tmpTxt}' | tr -d '\\n' > '${tmpB64}' && wc -c < '${tmpB64}'`;
+      `umask 077; /system/bin/timeout -k 2s 50s /system/bin/sh "$SH" "$BUNDLE" status > '${tmpTxt}' && ` +
+      `base64 -w 0 '${tmpTxt}' > '${tmpB64}' && rm -f '${tmpTxt}' && wc -c < '${tmpB64}'`;
     try {
       const prep = await ksuExec(prepCmd, 60000);
       if (prep.errno !== 0) {
         throw new Error(extractBackendError(prep, '读取状态失败'));
       }
-      const totalBytes = Number.parseInt(prep.stdout.trim(), 10);
-      if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
-        throw new Error('后端状态输出为空');
+      const totalBytes = Number(prep.stdout.trim());
+      if (!Number.isSafeInteger(totalBytes) || totalBytes <= 0 || totalBytes > MAX_STATUS_BASE64_BYTES) {
+        throw new Error('后端状态输出大小异常');
       }
       const chunks = [];
       const count = Math.ceil(totalBytes / CHUNK_SIZE);
       for (let i = 0; i < count; i++) {
         const readRes = await ksuExec(`dd if='${tmpB64}' bs=${CHUNK_SIZE} skip=${i} count=1 2>/dev/null`, 15000);
-        if (readRes.errno !== 0) throw new Error('分块读取状态失败');
+        const expectedBytes = Math.min(CHUNK_SIZE, totalBytes - i * CHUNK_SIZE);
+        if (readRes.errno !== 0 || readRes.stdout.length !== expectedBytes) {
+          throw new Error('分块读取状态失败');
+        }
         chunks.push(readRes.stdout);
       }
       const bytes = C.base64ToBytes(chunks.join(''));
       return new TextDecoder('utf-8').decode(bytes);
     } finally {
-      ksuExec(`rm -f '${tmpTxt}' '${tmpB64}' 2>/dev/null || true`, 5000).catch(() => {});
+      await ksuExec(`rm -f '${tmpTxt}' '${tmpB64}'; rmdir '${dir}'`, 5000).catch(() => {});
     }
   }
 
@@ -199,15 +209,17 @@
   }
 
   async function saveAutoRestoreConfig(enabled, targetSet, quiet = false) {
-    const cleanTarget = targetSet >= 2 && targetSet <= 7 ? targetSet : null;
-    const cfg = { enabled: Boolean(enabled && cleanTarget), targetSet: cleanTarget };
-    const text = C.serializeAutoRestoreConfig(cfg);
-    const b64 = btoa(text);
-    const res = await ksuExec(
-      `mkdir -p /data/adb/voltset/persistent && printf '%s' '${b64}' | base64 -d > '${AUTO_RESTORE_CONF}.tmp' && mv '${AUTO_RESTORE_CONF}.tmp' '${AUTO_RESTORE_CONF}'`,
-      5000
-    );
-    if (res.errno !== 0) throw new Error('保存开机自动写入配置失败');
+    const cleanTarget = Number.isInteger(targetSet) && targetSet >= 2 && targetSet <= 7 ? targetSet : null;
+    const snap = state.snapshot;
+    const pdpCdbSha256 = enabled && snap ? snap.pdpCdbSha256 : null;
+    if (enabled && (!cleanTarget || !pdpCdbSha256)) {
+      throw new Error('缺少可核对的 pdp_cdb 设备状态，请刷新后重试');
+    }
+    const args = enabled
+      ? ['set_auto_restore', '1', cleanTarget, snap.bootId, pdpCdbSha256]
+      : ['set_auto_restore', '0', cleanTarget ?? ''];
+    await runBackendSmall(args);
+    const cfg = { enabled, targetSet: cleanTarget, pdpCdbSha256 };
     state.autoRestore = cfg;
     if (!quiet) {
       showToast(cfg.enabled ? `已开启开机自动写入：每次开机写入 Set ${cfg.targetSet}` : '已关闭开机自动写入');
@@ -242,80 +254,161 @@
 
   // ---- QPT Power Monitoring ----
   async function startQptMonitor() {
-    if (state.qptMonitoring) return;
+    if (qptTask) return;
+    const task = { stopped: false, stop: null };
+    qptTask = task;
     state.qptMonitoring = true;
-    state.qptLastSample = null;
-    state.qptIntervals = [];
-    state.qptInstant = null;
-    state.qptSession = null;
-    state.qptError = null;
-    state.qptZeroStreak = 0;
-    state.qptTurnedOnBySelf = false;
-    render();
-
+    resetQptSession();
     try {
-      const out = await runBackendSmall(['power_enable'], 8000);
-      const parsed = C.parseBackendOutput(out);
-      state.qptTurnedOnBySelf = parsed.values.QPT_CHANGED === '1';
-    } catch (e) {
-      state.qptError = e.message || '无法开启 QPT 硬件功耗遥测';
-      render();
-    }
-
-    await pollQptOnce();
-    if (state.qptMonitoring) {
-      state.qptTimer = setInterval(pollQptOnce, 1000);
+      if (typeof window.ksu?.spawn === 'function') {
+        await streamQpt(task);
+      } else {
+        await pollQptForOlderHost(task);
+      }
+    } catch (error) {
+      if (!task.stopped) state.qptError = error.message || '读取硬件功耗失败';
+    } finally {
+      qptTask = null;
+      state.qptMonitoring = false;
+      updateQptDisplay();
     }
   }
 
-  async function pollQptOnce() {
-    if (!state.qptMonitoring || state.qptPollingInFlight) return;
-    state.qptPollingInFlight = true;
-    try {
-      const out = await runBackendSmall(['power_sample'], 6000);
-      const nowNs = Math.round(performance.now() * 1000000);
-      const sample = C.parseQptSample(out, nowNs);
-      const prev = state.qptLastSample;
-      state.qptLastSample = sample;
-      if (prev) {
-        const delta = C.computeQptDelta(prev, sample);
-        if (delta) {
-          if (state.qptIntervals.length >= 600) state.qptIntervals.shift();
-          state.qptIntervals.push(delta);
-          state.qptInstant = delta;
-          state.qptSession = C.summarizeQptSession(state.qptIntervals);
-          if ((delta.socTotalMw || 0) <= 0.001) {
-            state.qptZeroStreak++;
-          } else {
-            state.qptZeroStreak = 0;
-          }
-          state.qptError =
-            state.qptZeroStreak >= 3 ? 'QPT 硬件计数器未增长（当前固件可能未启用实时功耗遥测）' : null;
-          render();
-        }
-      }
-    } catch (e) {
-      state.qptError = e.message || '读取硬件功耗失败';
-      render();
-    } finally {
-      state.qptPollingInFlight = false;
+  async function streamQpt(task) {
+    const prep = await ksuExec(
+      'umask 077; mkdir -p /data/adb/voltset && ' +
+      'mktemp /data/adb/voltset/qpt-web.XXXXXXXX',
+      5000
+    );
+    const lease = prep.stdout.trim();
+    if (prep.errno !== 0 || !/^\/data\/adb\/voltset\/qpt-web\.[a-zA-Z0-9]{8}$/.test(lease)) {
+      throw new Error('无法创建 QPT 监测会话');
     }
+    let release;
+    const releaseLease = () => release ??= ksuExec(`rm -f '${lease}'`, 4000).catch(() => {});
+    try {
+      if (task.stopped) return;
+      await new Promise((resolve, reject) => {
+        const cb = `__voltsetQptCb_${++execSeq}`;
+        let heartbeat;
+        let watchdog;
+        let errorDetail;
+        let finished = false;
+        let refreshingLease = false;
+        const finish = (error) => {
+          if (finished) return;
+          finished = true;
+          clearInterval(heartbeat);
+          clearTimeout(watchdog);
+          delete window[cb];
+          if (error && !task.stopped) reject(error);
+          else resolve();
+        };
+        const expectFrame = (timeoutMs) => {
+          clearTimeout(watchdog);
+          watchdog = setTimeout(() => finish(new Error('QPT 采样超时')), timeoutMs);
+        };
+        const exit = (code) => finish(new Error(errorDetail || `QPT 采样已中断（${code}）`));
+        const fail = (error) => finish(new Error(errorDetail || error?.message || '无法启动 QPT 采样'));
+        window[cb] = {
+          stdout: {
+            emit(event, data) {
+              if (event !== 'data' || task.stopped || finished) return;
+              for (const line of String(data).split(/\r?\n/)) {
+                const sample = C.parseQptStreamFrame(line);
+                if (sample) {
+                  expectFrame(7000);
+                  acceptQptSample(sample);
+                }
+              }
+            },
+          },
+          stderr: {
+            emit(event, data) {
+              if (event === 'data') errorDetail = String(data).trim().replace(/^ERROR /, '');
+            },
+          },
+          emit(event, value) {
+            if (event === 'exit') exit(value);
+            else if (event === 'error') fail(value);
+          },
+          exit,
+          error: fail,
+        };
+        heartbeat = setInterval(async () => {
+          if (refreshingLease || finished || task.stopped) return;
+          refreshingLease = true;
+          try {
+            const res = await ksuExec(`touch -c '${lease}'`, 4000);
+            if (res.errno !== 0) throw new Error('QPT 采样会话续期失败');
+          } catch (error) {
+            finish(error);
+          } finally {
+            refreshingLease = false;
+          }
+        }, 5000);
+        task.stop = () => {
+          clearInterval(heartbeat);
+          releaseLease();
+          expectFrame(4000);
+        };
+        expectFrame(10000);
+        const command = `${RESOLVE_BUNDLE}; /system/bin/sh "$SH" "$BUNDLE" power_stream '${lease}'`;
+        try {
+          window.ksu.spawn(command, '[]', '{}', cb);
+        } catch (error) {
+          finish(error);
+        }
+      });
+    } finally {
+      task.stop = null;
+      await releaseLease();
+    }
+  }
+
+  async function pollQptForOlderHost(task) {
+    const response = await runBackendSmall(['power_enable'], 8000);
+    const ownsEnable = C.parseBackendOutput(response).values.QPT_CHANGED === '1';
+    try {
+      while (!task.stopped) {
+        const out = await runBackendSmall(['power_sample'], 6000);
+        if (task.stopped) break;
+        acceptQptSample(C.parseQptSample(out, Math.round(performance.now() * 1000000)));
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, 1000);
+          task.stop = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+        });
+        task.stop = null;
+      }
+    } finally {
+      if (ownsEnable) await runBackendSmall(['power_disable'], 5000);
+    }
+  }
+
+  function acceptQptSample(sample) {
+    const previous = state.qptLastSample;
+    state.qptLastSample = sample;
+    if (!previous) return;
+    const delta = C.computeQptDelta(previous, sample);
+    if (!delta) return;
+    if (state.qptIntervals.length >= 600) state.qptIntervals.shift();
+    state.qptIntervals.push(delta);
+    state.qptInstant = delta;
+    state.qptSession = C.summarizeQptSession(state.qptIntervals);
+    state.qptZeroStreak = (delta.socTotalMw || 0) <= 0.001 ? state.qptZeroStreak + 1 : 0;
+    state.qptError = state.qptZeroStreak >= 3 ? 'QPT 硬件计数器未增长（当前固件可能未启用实时功耗遥测）' : null;
+    updateQptDisplay();
   }
 
   function stopQptMonitor() {
-    if (state.qptTimer) {
-      clearInterval(state.qptTimer);
-      state.qptTimer = null;
-    }
-    const wasOnBySelf = state.qptTurnedOnBySelf;
-    state.qptTurnedOnBySelf = false;
-    if (state.qptMonitoring) {
-      state.qptMonitoring = false;
-      render();
-    }
-    if (wasOnBySelf) {
-      runBackendSmall(['power_disable'], 5000).catch(() => {});
-    }
+    if (!qptTask || qptTask.stopped) return;
+    qptTask.stopped = true;
+    state.qptMonitoring = false;
+    qptTask.stop?.();
+    updateQptDisplay();
   }
 
   function toggleQptMonitor() {
@@ -330,7 +423,7 @@
     state.qptSession = null;
     state.qptError = null;
     state.qptZeroStreak = 0;
-    render();
+    updateQptDisplay();
   }
 
   async function saveCurrentPowerRecord() {
@@ -457,7 +550,8 @@
           await saveAutoRestoreConfig(false, state.autoRestore.targetSet, true);
           syncNote = '（已同时关闭开机自动写入）';
         } catch (_) {}
-      } else if (newCpuss >= 2 && newCpuss <= 7 && state.autoRestore.enabled) {
+      } else if (newCpuss >= 2 && newCpuss <= 7 && state.autoRestore.enabled &&
+          state.autoRestore.pdpCdbSha256 && state.autoRestore.pdpCdbSha256 === snap.pdpCdbSha256) {
         try {
           await saveAutoRestoreConfig(true, newCpuss, true);
           syncNote = `（开机自动写入已同步为 Set ${newCpuss}）`;
@@ -553,18 +647,35 @@
               <strong>已设定下次开机为 Set ${snap.pendingSetIndex}</strong>
               <div style="margin-top:2px">当前硬件仍按 ${running !== null ? `Set ${running}` : '开机原状态'} 运行，需完整重启。</div>
             </div>
-            <button type="button" id="rebootBtn" ${controlsEnabled ? '' : 'disabled'}>立即重启</button>
+            <div class="row wrap">
+              <button type="button" id="rebootBtn" ${controlsEnabled ? '' : 'disabled'}>立即重启</button>
+              ${
+                running !== null && snap.activeBootSet
+                  ? `<button type="button" id="revertBootSetBtn" ${controlsEnabled && snap.canSelectSet(running) ? '' : 'disabled'}>撤回至 Set ${running}</button>`
+                  : ''
+              }
+            </div>
           </div>
         </div>`
       : '';
 
     const resetBtn =
-      running !== null && running !== 1 && !snap.overrideLockedByFirmware
+      sdamIdx !== null && sdamIdx !== 1 && !snap.overrideLockedByFirmware
         ? `<button type="button" id="resetSet1Btn" ${controlsEnabled && snap.canSelectSet(1) ? '' : 'disabled'}>还原默认 Set 1</button>`
+        : '';
+
+    const abnormalBootBanner =
+      snap.systemProbe && (snap.systemProbe.isAbnormalBoot || snap.systemProbe.hasPstoreCrash)
+        ? `<div class="banner warn">
+            <strong>检测到异常重启或内核崩溃线索</strong>
+            ${snap.systemProbe.bootReason ? `<div style="margin-top:4px">上次启动原因：${esc(snap.systemProbe.bootReason)}</div>` : ''}
+            ${snap.systemProbe.pstoreCrash ? `<div style="margin-top:2px" class="mono">${esc(snap.systemProbe.pstoreCrash)}</div>` : ''}
+          </div>`
         : '';
 
     return `
       ${cdtBanner}
+      ${abnormalBootBanner}
       <div class="card">
         <div class="row-between">
           <div>
@@ -685,12 +796,15 @@
     if (!snap.canWriteOverrides) blockReason = '缺少 SDAM 写入权限或接口';
     else if (snap.overrideLockedByFirmware) blockReason = 'pdp_cdb 固件已强制锁档';
     else if (snap.cdtStatus.key7Enabled) blockReason = '检测到 CDT Key 7 开启（叠加降压危险）';
+    else if (!['EMPTY', 'STOCK'].includes(snap.cdtStatus.state)) blockReason = '无法确认 CDT Key 7 已关闭';
+    else if (!snap.pdpCdbSha256) blockReason = '缺少 pdp_cdb 指纹';
     else if (snap.compatibility.level === 'UNSUPPORTED') blockReason = '当前设备兼容性检测未通过';
     else if (!sets.length) blockReason = '未检测到 Set 2..7 档位';
 
     const ar = state.autoRestore;
-    const chipHtml = ar.enabled && ar.targetSet
-      ? `<span class="chip good tnum">已开启 · Set ${ar.targetSet}</span>`
+    const needsReview = ar.enabled && (!ar.pdpCdbSha256 || ar.pdpCdbSha256 !== snap.pdpCdbSha256);
+    const chipHtml = ar.enabled
+      ? `<span class="chip ${needsReview ? '' : 'good'} tnum">${needsReview ? '待确认' : '已开启'} · Set ${ar.targetSet}</span>`
       : '<span class="chip">已关闭</span>';
 
     const optionsHtml = sets
@@ -712,10 +826,11 @@
           ${chipHtml}
         </div>
         ${blockReason ? `<div class="banner warn">${esc(blockReason)}</div>` : ''}
+        ${needsReview ? '<div class="banner warn">pdp_cdb 指纹缺失或已变化。确认目标档位后，关闭再开启自动写入。</div>' : ''}
         <div class="row-between">
           <div class="row">
             <span class="muted">目标档位</span>
-            <select id="autoRestoreSelect" ${!controlsEnabled || Boolean(blockReason) ? 'disabled' : ''}>
+            <select id="autoRestoreSelect" ${!controlsEnabled || Boolean(blockReason) || needsReview ? 'disabled' : ''}>
               ${optionsHtml}
             </select>
           </div>
@@ -724,7 +839,7 @@
           }>${ar.enabled ? '关闭开机自动写' : '开启开机自动写'}</button>
         </div>
         ${lastLine}
-        <div class="muted" style="font-size:12px">开启后每次开机完成都会向 SDAM2 重新写入目标 Set 并做回读校验（绝不自动重启）。注：SDAM2 写入在下次重启生效；若机型在 Bootloader 阶段即清零 SDAM，则无法靠系统脚本拦截当次开机。</div>
+        <div class="muted" style="font-size:12px">开机完成后核对固件、CDT 和重启原因，SDAM2 掉档时才补写并回读。写入在下次重启生效，由你决定何时重启。</div>
       </div>
     `;
   }
@@ -810,67 +925,95 @@
     return v !== null && v !== undefined ? `${Math.round(v)} mW` : '-- mW';
   }
 
-  function renderPowerTab(snap) {
-    const qptAvailable = snap.systemProbe && snap.systemProbe.qptRails && snap.systemProbe.qptRails.length > 0;
+  function updateQptDisplay() {
+    const get = (id) => document.getElementById(id);
+    const card = get('qptMonitor');
+    if (!card) return;
+
     const instant = state.qptInstant;
     const session = state.qptSession;
-    const records = Object.values(state.savedPowerRecords || {}).sort((a, b) => a.setId - b.setId);
-    const baseRec = state.savedPowerRecords ? state.savedPowerRecords[1] : null;
-    const bootSetId = snap.bootCpussIndex;
+    const bootSetId = state.snapshot?.bootCpussIndex;
+    const available = state.snapshot?.systemProbe?.qptRails?.length > 0;
+    const monitoring = state.qptMonitoring;
+    const stopping = Boolean(qptTask && !monitoring);
+    const writeText = (id, value) => {
+      const node = get(id);
+      if (node.textContent !== value) node.textContent = value;
+    };
 
-    const subtitle = session
-      ? `已采样 ${session.sampleCount} 次 · ${Math.round(session.elapsedSec)}s${bootSetId ? ` · Set ${bootSetId}` : ''}`
-      : state.qptMonitoring
-      ? '正在开启遥测并等待首次双点采样…'
-      : qptAvailable
-      ? '按需开启 /sys/class/powercap/qpt · 停止/切页自动关闭'
+    card.classList.toggle('highlight', monitoring);
+    const toggle = get('qptToggleBtn');
+    toggle.disabled = stopping || (!monitoring && !available);
+    toggle.classList.toggle('primary', !monitoring);
+    writeText('qptToggleBtn', monitoring ? '停止监测' : stopping ? '正在停止…' : '开始监测');
+
+    let subtitle = available
+      ? '按需开启 QPT · 停止监测后恢复开关'
       : '未在本机检测到可用的 QPT powercap 功耗轨';
+    if (session) {
+      const tempSuffix =
+        instant && instant.cpuTempC !== null && instant.cpuTempC !== undefined
+          ? ` · ${instant.cpuTempC.toFixed(1)}°C`
+          : '';
+      subtitle = `已采样 ${session.sampleCount} 次 · ${Math.round(session.elapsedSec)}s${bootSetId ? ` · Set ${bootSetId}` : ''}${tempSuffix}`;
+    } else if (monitoring) {
+      subtitle = '正在开启遥测并等待首次双点采样…';
+    }
+    writeText('qptSubtitle', subtitle);
+    get('qptNotice').hidden = !state.qptError;
+    writeText('qptError', state.qptError || '');
 
-    const tilesHtml =
-      instant || state.qptMonitoring
-        ? `
-          <div class="grid-2">
-            <div class="subbox">
-              <div class="label-xs">中核 cpu-m</div>
-              <div class="val-lg tnum">${formatMw(instant ? instant.cpuMidMw : null)}</div>
-              <div class="label-xs tnum">${instant && instant.cpu0FreqKhz > 0 ? `${Math.trunc(instant.cpu0FreqKhz / 1000)} MHz` : '--'}</div>
-            </div>
-            <div class="subbox">
-              <div class="label-xs">大核 cpu-l</div>
-              <div class="val-lg tnum">${formatMw(instant ? instant.cpuLargeMw : null)}</div>
-              <div class="label-xs tnum">${instant && instant.cpu1FreqKhz > 0 ? `${Math.trunc(instant.cpu1FreqKhz / 1000)} MHz` : '--'}</div>
-            </div>
-            <div class="subbox">
-              <div class="label-xs">GPU</div>
-              <div class="val-lg tnum">${formatMw(instant ? instant.gpuMw : null)}</div>
-              <div class="label-xs tnum">${instant && instant.gpuFreqHz > 0 ? `${Math.trunc(instant.gpuFreqHz / 1000000)} MHz` : '--'}</div>
-            </div>
-            <div class="subbox primary">
-              <div class="label-xs">CPU 合计 (中核 + 大核)</div>
-              <div class="val-lg tnum">${formatMw(instant ? instant.cpuTotalMw : null)}</div>
-              <div class="label-xs tnum">${instant && instant.nspMw >= 1 ? `NSP ${Math.round(instant.nspMw)} mW` : 'SoC 硬件能量差值'}</div>
-            </div>
-          </div>
-        `
-        : '';
+    const freq = (value, scale) => value > 0 ? `${Math.trunc(value / scale)} MHz` : '--';
+    get('qptReadings').hidden = !instant && !monitoring;
+    writeText('qptMidPower', formatMw(instant?.cpuMidMw));
+    writeText('qptLargePower', formatMw(instant?.cpuLargeMw));
+    writeText('qptGpuPower', formatMw(instant?.gpuMw));
+    writeText('qptCpuPower', formatMw(instant?.cpuTotalMw));
+    writeText('qptMidFreq', freq(instant?.cpu0FreqKhz, 1000));
+    writeText('qptLargeFreq', freq(instant?.cpu1FreqKhz, 1000));
+    writeText('qptGpuFreq', freq(instant?.gpuFreqHz, 1000000));
+    const tempNote =
+      instant && instant.cpuTempC !== null && instant.cpuTempC !== undefined
+        ? `SoC ${instant.cpuTempC.toFixed(1)}°C`
+        : 'SoC 硬件能量差值';
+    writeText('qptCpuNote', instant?.nspMw >= 1 ? `NSP ${Math.round(instant.nspMw)} mW` : tempNote);
 
-    const sessionHtml = session
-      ? `
-        <div class="subbox">
-          <div class="tnum" style="font-size:13px;font-weight:600">
-            本轮均值：CPU 合计 ${formatMw(session.avgCpuTotalMw)}（中核 ${formatMw(session.avgCpuMidMw)} / 大核 ${formatMw(
-              session.avgCpuLargeMw
-            )}） · GPU ${formatMw(session.avgGpuMw)}
-          </div>
-          <div class="row-between" style="margin-top:6px">
-            <button type="button" class="ghost" id="qptResetBtn">重置统计</button>
-            <button type="button" id="qptSaveBtn" ${bootSetId && session.sampleCount >= 3 ? '' : 'disabled'}>
-              ${bootSetId ? `记录为 Set ${bootSetId} 均功耗` : '档位待确认'}
-            </button>
-          </div>
-        </div>
-      `
-      : '';
+    const history = state.qptIntervals.slice(-60);
+    const sparkWrap = get('qptSparklineWrap');
+    if (sparkWrap) sparkWrap.hidden = history.length < 2;
+    if (history.length >= 2) {
+      const cpuVals = history.map((s) => s.cpuTotalMw || 0);
+      const gpuVals = history.map((s) => s.gpuMw || 0);
+      const peakMw = Math.max(100, ...cpuVals, ...gpuVals);
+      writeText('qptSparklinePeak', `峰值 ${Math.round(peakMw)} mW`);
+      const buildPoints = (vals) =>
+        vals
+          .map((v, i) => {
+            const x = ((i * 300) / Math.max(1, vals.length - 1)).toFixed(1);
+            const y = (60 - Math.max(0, Math.min(1, v / peakMw)) * 56).toFixed(1);
+            return `${x},${y}`;
+          })
+          .join(' ');
+      const cpuLine = get('qptCpuPath');
+      if (cpuLine && typeof cpuLine.setAttribute === 'function') cpuLine.setAttribute('points', buildPoints(cpuVals));
+      const gpuLine = get('qptGpuPath');
+      if (gpuLine && typeof gpuLine.setAttribute === 'function') gpuLine.setAttribute('points', buildPoints(gpuVals));
+    }
+
+    get('qptStats').hidden = !session;
+    if (session) {
+      writeText('qptAverage',
+        `本轮均值：CPU 合计 ${formatMw(session.avgCpuTotalMw)}（中核 ${formatMw(session.avgCpuMidMw)} / 大核 ${formatMw(
+          session.avgCpuLargeMw
+        )}） · GPU ${formatMw(session.avgGpuMw)}`);
+      get('qptSaveBtn').disabled = !bootSetId || session.sampleCount < 3;
+      writeText('qptSaveBtn', bootSetId ? `记录为 Set ${bootSetId} 均功耗` : '档位待确认');
+    }
+  }
+
+  function renderPowerTab() {
+    const records = Object.values(state.savedPowerRecords).sort((a, b) => a.setId - b.setId);
+    const baseRec = state.savedPowerRecords[1];
 
     const recordsHtml = records.length
       ? `
@@ -889,11 +1032,18 @@
                 const cls = dm < 0 ? 'chip good' : dm > 0 ? 'chip warn' : 'chip';
                 deltaBadge = `<span class="${cls} tnum">${sign}${dm} mW (${sign}${pct}%)</span>`;
               }
+              const extraParts = [];
+              if (r.avgCpu0Mhz > 0 || r.avgCpu1Mhz > 0) extraParts.push(`均频 ${r.avgCpu0Mhz}/${r.avgCpu1Mhz} MHz`);
+              if (r.avgCpuTempC !== null && r.avgCpuTempC !== undefined) extraParts.push(`${r.avgCpuTempC.toFixed(1)}°C`);
+              const extraHtml = extraParts.length
+                ? `<div class="label-xs tnum">${esc(extraParts.join(' · '))}</div>`
+                : '';
               return `
                 <div class="subbox row-between" style="flex-direction:row;align-items:center">
                   <div>
                     <div class="title-sm tnum">Set ${r.setId} · CPU ${r.avgCpuTotalMw} mW (${r.elapsedSec}s)</div>
                     <div class="label-xs tnum">中核 ${r.avgCpuMidMw} · 大核 ${r.avgCpuLargeMw} · GPU ${r.avgGpuMw} mW</div>
+                    ${extraHtml}
                   </div>
                   <div class="row">
                     ${deltaBadge}
@@ -908,19 +1058,58 @@
       : `<div class="card"><div class="title-sm">跨档位功耗对比</div><div class="muted">先在某个档位（如 Set 1）开启监测至少 3 秒并点击「记录为 Set 1 均功耗」，切换到 Set 6 重启后再固定相同负载记录一次，即可直接查看 mW 与百分比差异。</div></div>`;
 
     return `
-      <div class="card ${state.qptMonitoring ? 'highlight' : ''}">
+      <div class="card" id="qptMonitor">
         <div class="row-between">
           <div>
             <div class="title-md">硬件实时功耗 (QPT)</div>
-            <div class="muted tnum">${esc(subtitle)}</div>
+            <div class="muted tnum" id="qptSubtitle"></div>
           </div>
-          <button type="button" id="qptToggleBtn" class="${state.qptMonitoring ? '' : 'primary'}" ${
-            qptAvailable || state.qptMonitoring ? '' : 'disabled'
-          }>${state.qptMonitoring ? '停止监测' : '开始监测'}</button>
+          <button type="button" id="qptToggleBtn"></button>
         </div>
-        ${state.qptError ? `<div class="banner warn">${esc(state.qptError)}</div>` : ''}
-        ${tilesHtml}
-        ${sessionHtml}
+        <div id="qptNotice" hidden><div class="banner warn" id="qptError"></div></div>
+        <div id="qptReadings" hidden>
+          <div class="grid-2">
+            <div class="subbox">
+              <div class="label-xs">中核 cpu-m</div>
+              <div class="val-lg tnum" id="qptMidPower"></div>
+              <div class="label-xs tnum" id="qptMidFreq"></div>
+            </div>
+            <div class="subbox">
+              <div class="label-xs">大核 cpu-l</div>
+              <div class="val-lg tnum" id="qptLargePower"></div>
+              <div class="label-xs tnum" id="qptLargeFreq"></div>
+            </div>
+            <div class="subbox">
+              <div class="label-xs">GPU</div>
+              <div class="val-lg tnum" id="qptGpuPower"></div>
+              <div class="label-xs tnum" id="qptGpuFreq"></div>
+            </div>
+            <div class="subbox primary">
+              <div class="label-xs">CPU 合计 (中核 + 大核)</div>
+              <div class="val-lg tnum" id="qptCpuPower"></div>
+              <div class="label-xs tnum" id="qptCpuNote"></div>
+            </div>
+          </div>
+          <div class="sparkline-box" id="qptSparklineWrap" style="margin-top:10px" hidden>
+            <div class="row-between">
+              <span class="label-xs" style="color:var(--primary);font-weight:600">CPU / GPU 实时功耗曲线</span>
+              <span class="label-xs tnum" id="qptSparklinePeak"></span>
+            </div>
+            <svg class="sparkline-svg" viewBox="0 0 300 64" preserveAspectRatio="none" aria-hidden="true">
+              <polyline id="qptGpuPath" fill="none" stroke="var(--good-accent)" stroke-width="1.6" stroke-opacity="0.7" points=""></polyline>
+              <polyline id="qptCpuPath" fill="none" stroke="var(--primary)" stroke-width="2" points=""></polyline>
+            </svg>
+          </div>
+        </div>
+        <div id="qptStats" hidden>
+          <div class="subbox">
+            <div class="tnum" style="font-size:13px;font-weight:600" id="qptAverage"></div>
+            <div class="row-between" style="margin-top:6px">
+              <button type="button" class="ghost" id="qptResetBtn">重置统计</button>
+              <button type="button" id="qptSaveBtn" disabled></button>
+            </div>
+          </div>
+        </div>
       </div>
       ${recordsHtml}
     `;
@@ -1130,13 +1319,33 @@
               <summary>全机只读自动探测（${probe.pdpCdtPartitions.length} 个分区 · ${probe.cpufreqPolicies.length} 个 CPU 簇）</summary>
               <div class="detail-list">
                 <div class="probe-item"><span class="label-xs">qcom_voltage_adj 目录</span><span class="mono">${esc(probe.adjDirPath || '未发现')}</span></div>
-                <div class="probe-item"><span class="label-xs">PMIC regmap / SDAM2 nvmem</span><span class="mono">${esc(probe.regmapNode || '未命中')} | ${esc(probe.sdam2NvmemPath || '未发现')}</span></div>
+                <div class="probe-item"><span class="label-xs">平台设备 / 驱动</span><span class="mono">${esc(
+                  probe.vadjPlatformDevice
+                    ? `${probe.vadjPlatformDevice} (driver=${probe.vadjDriver || 'unknown'}, spmi=${probe.vadjSpmiParent || 'unknown'})`
+                    : '未发现'
+                )}</span></div>
+                <div class="probe-item"><span class="label-xs">设备树路径</span><span class="mono">${esc(probe.vadjDtPath || '未发现')}</span></div>
+                <div class="probe-item"><span class="label-xs">内核模块</span><span class="mono">${
+                  probe.vadjModuleLoaded ? '已加载' : '未加载'
+                } | ${esc(probe.vadjModuleFiles.join(', ') || '磁盘未发现 *voltage_adj*.ko')}</span></div>
+                <div class="probe-item"><span class="label-xs">PMIC regmap / SDAM2 nvmem</span><span class="mono">${esc(probe.regmapNode || '未命中')} | ${esc(probe.sdam2NvmemPath || '未发现')}${probe.sdam2Pmic ? ` (${esc(probe.sdam2Pmic)})` : ''}</span></div>
+                <div class="probe-item"><span class="label-xs">debugfs 挂载与节点</span><span class="mono">${esc(
+                  probe.debugfsMounts.join(', ') || '未挂载'
+                )}${probe.debugfsVoltNodes.length ? `\n${esc(probe.debugfsVoltNodes.join('\n'))}` : ''}</span></div>
+                <div class="probe-item"><span class="label-xs">GPT 发现分区 (pdp/cdt)</span><span class="mono">${esc(probe.pdpCdtPartitions.join(', ') || '未发现')}</span></div>
+                <div class="probe-item"><span class="label-xs">by-name 目录</span><span class="mono">${esc(probe.byNameDirs.join(', ') || '未发现')}</span></div>
+                <div class="probe-item"><span class="label-xs">SCMI 接口</span><span class="mono">${probe.scmiDeviceCount} 个设备${
+                  probe.scmiDrivers.length ? ` | ${esc(probe.scmiDrivers.join(', '))}` : ''
+                }</span></div>
                 <div class="probe-item"><span class="label-xs">CPU 调频簇</span><span class="mono">${esc(probe.cpufreqPolicies.join(', ') || '未读取')}</span></div>
                 <div class="probe-item"><span class="label-xs">energy_model 零模块域</span><span class="mono">${esc(probe.energyModelDomains.join(', ') || '未发现')}</span></div>
+                <div class="probe-item"><span class="label-xs">硅片信息 (qcom_socinfo)</span><span class="mono">${esc(probe.socInfo || '未读取')}</span></div>
                 <div class="probe-item"><span class="label-xs">QFPROM 老化熔丝</span><span class="mono">${
                   qf ? `clus0=${fmtDelta(qf.clus0FusedDelta)}, clus1=${fmtDelta(qf.clus1FusedDelta)} (${qf.formattedHex})` : '未读取'
                 }</span></div>
                 <div class="probe-item"><span class="label-xs">QPT 硬件功耗轨</span><span class="mono">${esc(probe.qptRails.join(', ') || '未发现')}</span></div>
+                <div class="probe-item"><span class="label-xs">启动原因 (boot_reason)</span><span class="mono">${esc(probe.bootReason || '未读取')}</span></div>
+                <div class="probe-item"><span class="label-xs">内核崩溃日志 (pstore)</span><span class="mono">${esc(probe.pstoreCrash || '无异常记录')}</span></div>
               </div>
             </details>
           </div>
@@ -1231,12 +1440,13 @@
 
     let bodyHtml = '';
     if (state.tab === 'sets') bodyHtml = renderSetsTab(snap, controlsEnabled);
-    else if (state.tab === 'power') bodyHtml = renderPowerTab(snap);
+    else if (state.tab === 'power') bodyHtml = renderPowerTab();
     else if (state.tab === 'voltage') bodyHtml = renderVoltageTab(snap, controlsEnabled);
     else bodyHtml = renderCompatTab(snap);
 
     main.innerHTML = errorBanner + bodyHtml;
     bindInteractions();
+    updateQptDisplay();
   }
 
   function bindInteractions() {
@@ -1245,6 +1455,10 @@
     if (br) br.onclick = refresh;
     const rebootBtn = document.getElementById('rebootBtn');
     if (rebootBtn) rebootBtn.onclick = openRebootModal;
+    const revertBtn = document.getElementById('revertBootSetBtn');
+    if (revertBtn && snap && snap.bootCpussIndex !== null) {
+      revertBtn.onclick = () => openApplyModal(snap.bootCpussIndex);
+    }
     const resetBtn = document.getElementById('resetSet1Btn');
     if (resetBtn) resetBtn.onclick = () => openApplyModal(1);
 
@@ -1260,7 +1474,7 @@
           if (state.autoRestore.enabled) {
             await saveAutoRestoreConfig(true, chosen);
           } else {
-            state.autoRestore = { enabled: false, targetSet: chosen };
+            state.autoRestore = { enabled: false, targetSet: chosen, pdpCdbSha256: null };
           }
         } catch (e) {
           showToast(e.message || '保存配置失败');

@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -35,23 +36,35 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import io.voltset.sm8850.CpuStressMode
 import io.voltset.sm8850.R
 import io.voltset.sm8850.VoltSetUiState
 import io.voltset.sm8850.core.BaselineSource
+import io.voltset.sm8850.core.ClusterHardwareLimits
 import io.voltset.sm8850.core.ClusterVoltageStats
 import io.voltset.sm8850.core.CprhDriftAssessment
 import io.voltset.sm8850.core.DeviceSnapshot
+import io.voltset.sm8850.core.QptInstantPower
 import io.voltset.sm8850.core.SavedSetPowerRecord
 import io.voltset.sm8850.core.ScmiDataSource
 import io.voltset.sm8850.core.ScmiPlanParser
@@ -70,6 +83,8 @@ internal fun VoltageScreen(
     onSavePowerRecord: () -> Unit,
     onDeletePowerRecord: (Int) -> Unit,
     onClearPowerRecords: () -> Unit,
+    onStartCpuStress: (CpuStressMode, Int) -> Unit,
+    onStopCpuStress: () -> Unit,
     onShowMessage: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -124,6 +139,17 @@ internal fun VoltageScreen(
             }
         }
 
+        item(key = "cpu_stress") {
+            Box(Modifier.padding(top = 12.dp)) {
+                CpuStressCard(
+                    state = state,
+                    hasQpt = snapshot.systemProbe.qptRails.isNotEmpty(),
+                    onStart = onStartCpuStress,
+                    onStop = onStopCpuStress,
+                )
+            }
+        }
+
         if (snapshot.scmiError != null) {
             item(key = "scmi_error") {
                 Box(Modifier.padding(top = 12.dp)) {
@@ -131,6 +157,19 @@ internal fun VoltageScreen(
                 }
             }
         } else {
+            if (rows.isNotEmpty()) {
+                item(key = "voltage_curve") {
+                    Box(Modifier.padding(top = 12.dp)) {
+                        CpuVoltageCurveCard(
+                            rows = rows,
+                            limits0 = snapshot.pdpHardwareLimits?.clus0,
+                            limits1 = snapshot.pdpHardwareLimits?.clus1,
+                            selectedClusterFilter = state.selectedClusterFilter,
+                        )
+                    }
+                }
+            }
+
             item(key = "filters") {
                 FlowRow(
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 8.dp),
@@ -648,8 +687,11 @@ private fun QptPowerCard(
                         fontWeight = FontWeight.Bold,
                     )
                     val subtitle = when {
-                        session != null -> "已采样 ${session.sampleCount} 次 · ${session.elapsedSec.roundToInt()}s" +
-                            (bootSetId?.let { " · Set $it" } ?: "")
+                        session != null -> buildString {
+                            append("已采样 ${session.sampleCount} 次 · ${session.elapsedSec.roundToInt()}s")
+                            bootSetId?.let { append(" · Set $it") }
+                            instant?.cpuTempC?.let { append(String.format(Locale.US, " · %.1f°C", it)) }
+                        }
                         state.qptMonitoring -> "正在等待首次双点采样…"
                         else -> "每秒读取硬件能量计数器 · 仅监测时运行"
                     }
@@ -720,10 +762,14 @@ private fun QptPowerCard(
                     QptRailBox(
                         title = "CPU 合计",
                         powerMw = instant?.cpuTotalMw,
-                        freqText = instant?.nspMw?.takeIf { it >= 1.0 }?.let { "NSP ${it.roundToInt()} mW" },
+                        freqText = instant?.nspMw?.takeIf { it >= 1.0 }?.let { "NSP ${it.roundToInt()} mW" }
+                            ?: instant?.cpuTempC?.let { String.format(Locale.US, "SoC %.1f°C", it) },
                         highlighted = true,
                         modifier = Modifier.weight(1f),
                     )
+                }
+                if (state.qptHistory.size >= 2) {
+                    QptSparkline(history = state.qptHistory)
                 }
             }
 
@@ -868,8 +914,15 @@ private fun SavedPowerRecordRow(
                     style = MaterialTheme.typography.bodySmall.merge(TabularStyle),
                     fontWeight = FontWeight.SemiBold,
                 )
+                val extraMeta = buildList {
+                    if (record.avgCpu0Mhz > 0 || record.avgCpu1Mhz > 0) {
+                        add("均频 ${record.avgCpu0Mhz}/${record.avgCpu1Mhz} MHz")
+                    }
+                    record.avgCpuTempC?.let { add(String.format(Locale.US, "%.1f°C", it)) }
+                }.joinToString(" · ")
                 Text(
-                    text = "中核 ${record.avgCpuMidMw} · 大核 ${record.avgCpuLargeMw} · GPU ${record.avgGpuMw} mW",
+                    text = "中核 ${record.avgCpuMidMw} · 大核 ${record.avgCpuLargeMw} · GPU ${record.avgGpuMw} mW" +
+                        if (extraMeta.isNotEmpty()) "\n$extraMeta" else "",
                     style = MaterialTheme.typography.labelSmall.merge(TabularStyle),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -897,6 +950,336 @@ private fun SavedPowerRecordRow(
             }
             TextButton(onClick = onDelete) {
                 Text("删除")
+            }
+        }
+    }
+}
+
+@Composable
+private fun QptSparkline(history: List<QptInstantPower>) {
+    val cpuValues = history.map { it.cpuTotalMw ?: 0.0 }
+    val gpuValues = history.map { it.gpuMw ?: 0.0 }
+    val peakMw = maxOf(cpuValues.maxOrNull() ?: 0.0, gpuValues.maxOrNull() ?: 0.0, 100.0)
+    val cpuColor = MaterialTheme.colorScheme.primary
+    val gpuColor = MaterialTheme.colorScheme.secondary
+    val gridColor = LocalVoltSetColors.current.subtleBorder
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("CPU 功耗曲线", style = MaterialTheme.typography.labelSmall, color = cpuColor)
+                Text("GPU", style = MaterialTheme.typography.labelSmall, color = gpuColor)
+            }
+            Text(
+                text = "峰值 ${peakMw.roundToInt()} mW",
+                style = MaterialTheme.typography.labelSmall.merge(TabularStyle),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Canvas(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(72.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
+                .padding(horizontal = 6.dp, vertical = 6.dp),
+        ) {
+            drawLine(gridColor, Offset(0f, size.height * 0.5f), Offset(size.width, size.height * 0.5f), 1.dp.toPx())
+            fun plot(values: List<Double>, color: Color) {
+                if (values.size < 2) return
+                val step = size.width / (values.size - 1).coerceAtLeast(1)
+                val path = Path()
+                values.forEachIndexed { i, v ->
+                    val x = i * step
+                    val y = size.height - (v / peakMw).toFloat().coerceIn(0f, 1f) * size.height
+                    if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                }
+                drawPath(path, color = color, style = Stroke(width = 2.dp.toPx()))
+            }
+            plot(gpuValues, gpuColor.copy(alpha = 0.8f))
+            plot(cpuValues, cpuColor)
+        }
+    }
+}
+
+@Composable
+private fun CpuVoltageCurveCard(
+    rows: List<VoltageDiffRow>,
+    limits0: ClusterHardwareLimits?,
+    limits1: ClusterHardwareLimits?,
+    selectedClusterFilter: Int?,
+) {
+    val semantic = LocalVoltSetColors.current
+    var localCluster by rememberSaveable { mutableIntStateOf(0) }
+    val activeCluster = selectedClusterFilter ?: localCluster
+    val clusterRows = remember(rows, activeCluster) {
+        rows.filter { it.domain == activeCluster }.sortedBy { it.freqKhz }
+    }
+    if (clusterRows.size < 2) return
+    val limits = if (activeCluster == 0) limits0 else limits1
+
+    val limitBounds = remember(clusterRows, limits) {
+        clusterRows.mapNotNull { r -> limits?.limitsByFreqKhz?.get(r.freqKhz)?.let { r.freqKhz to it } }
+    }
+    val hasBaseline = remember(clusterRows) { clusterRows.any { it.baselineMv != null } }
+    val allVoltages = buildList {
+        clusterRows.forEach { r ->
+            add(r.currentMv)
+            r.baselineMv?.let { add(it) }
+        }
+        limitBounds.forEach { (_, lim) ->
+            add(lim.cxFloorMv)
+            add(lim.cxCeilMv)
+        }
+    }
+    val minMv = allVoltages.minOrNull() ?: 400
+    val maxMv = allVoltages.maxOrNull()?.coerceAtLeast(minMv + 4) ?: 1100
+    val minFreq = clusterRows.first().freqKhz
+    val maxFreq = clusterRows.last().freqKhz.coerceAtLeast(minFreq + 1)
+
+    val currentColor = MaterialTheme.colorScheme.primary
+    val baseColor = MaterialTheme.colorScheme.onSurfaceVariant
+    val bandColor = semantic.goodAccent.copy(alpha = 0.14f)
+
+    Card(
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, semantic.subtleBorder),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "频压曲线 (${if (activeCluster == 0) "小核 PDP0" else "大核 PDP1"})",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                if (selectedClusterFilter == null) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        FilterChip(
+                            selected = localCluster == 0,
+                            onClick = { localCluster = 0 },
+                            label = { Text("PDP0") },
+                        )
+                        FilterChip(
+                            selected = localCluster == 1,
+                            onClick = { localCluster = 1 },
+                            label = { Text("PDP1") },
+                        )
+                    }
+                }
+            }
+
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text("当前计划电压", style = MaterialTheme.typography.labelSmall, color = currentColor)
+                if (hasBaseline) {
+                    Text("原厂基线 (虚线)", style = MaterialTheme.typography.labelSmall, color = baseColor)
+                }
+                if (limitBounds.size >= 2) {
+                    Text("硬件限位 [floor, ceil]", style = MaterialTheme.typography.labelSmall, color = semantic.goodAccent)
+                }
+            }
+
+            Canvas(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(112.dp)
+                    .padding(horizontal = 4.dp, vertical = 4.dp),
+            ) {
+                fun pt(freqKhz: Long, mv: Int): Offset {
+                    val x = (freqKhz - minFreq).toFloat() / (maxFreq - minFreq).toFloat() * size.width
+                    val y = size.height - (mv - minMv).toFloat() / (maxMv - minMv).toFloat() * size.height
+                    return Offset(x, y)
+                }
+
+                if (limitBounds.size >= 2) {
+                    val band = Path()
+                    limitBounds.forEachIndexed { idx, (freq, lim) ->
+                        val p = pt(freq, lim.cxCeilMv)
+                        if (idx == 0) band.moveTo(p.x, p.y) else band.lineTo(p.x, p.y)
+                    }
+                    for (idx in limitBounds.lastIndex downTo 0) {
+                        val (freq, lim) = limitBounds[idx]
+                        val p = pt(freq, lim.cxFloorMv)
+                        band.lineTo(p.x, p.y)
+                    }
+                    band.close()
+                    drawPath(band, color = bandColor)
+                }
+
+                if (hasBaseline) {
+                    val dashed = PathEffect.dashPathEffect(floatArrayOf(6.dp.toPx(), 4.dp.toPx()))
+                    val basePts = clusterRows.mapNotNull { r -> r.baselineMv?.let { pt(r.freqKhz, it) } }
+                    for (i in 1 until basePts.size) {
+                        drawLine(baseColor, basePts[i - 1], basePts[i], strokeWidth = 2.dp.toPx(), pathEffect = dashed)
+                    }
+                }
+
+                val curPts = clusterRows.map { pt(it.freqKhz, it.currentMv) }
+                for (i in 1 until curPts.size) {
+                    drawLine(currentColor, curPts[i - 1], curPts[i], strokeWidth = 2.2.dp.toPx())
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    text = "${formatFreqMhz(minFreq)} · ${minMv} mV",
+                    style = MaterialTheme.typography.labelSmall.merge(TabularStyle),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = "${formatFreqMhz(maxFreq)} · ${maxMv} mV",
+                    style = MaterialTheme.typography.labelSmall.merge(TabularStyle),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CpuStressCard(
+    state: VoltSetUiState,
+    hasQpt: Boolean,
+    onStart: (CpuStressMode, Int) -> Unit,
+    onStop: () -> Unit,
+) {
+    val semantic = LocalVoltSetColors.current
+    var mode by rememberSaveable { mutableStateOf(CpuStressMode.ALL_CORES) }
+    var seconds by rememberSaveable { mutableIntStateOf(30) }
+
+    Card(
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(
+            width = if (state.cpuStressRunning) 1.5.dp else 1.dp,
+            color = if (state.cpuStressRunning) MaterialTheme.colorScheme.primary else semantic.subtleBorder,
+        ),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = "CPU 稳定性压测",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        text = if (hasQpt) {
+                            "${mode.summary}（压测时自动联动 QPT 记录均功耗）"
+                        } else {
+                            mode.summary
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+                if (state.cpuStressRunning) {
+                    OutlinedButton(onClick = onStop) { Text("停止压测") }
+                } else {
+                    Button(
+                        onClick = { onStart(mode, seconds) },
+                        enabled = !state.busy,
+                    ) { Text("开始压测") }
+                }
+            }
+
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                for (option in CpuStressMode.entries) {
+                    FilterChip(
+                        selected = mode == option,
+                        onClick = { mode = option },
+                        enabled = !state.cpuStressRunning,
+                        label = { Text(option.label) },
+                    )
+                }
+            }
+
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                for (duration in listOf(15, 30, 60, 120)) {
+                    FilterChip(
+                        selected = seconds == duration,
+                        onClick = { seconds = duration },
+                        enabled = !state.cpuStressRunning,
+                        label = { Text("${duration} 秒") },
+                    )
+                }
+            }
+
+            state.cpuStressStats?.let { stats ->
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(
+                            text = "${stats.mode.label} · ${stats.elapsedSeconds}s / ${stats.threads} 线程 · 校验 ${stats.verifiedBlocks} 块 (${String.format(Locale.US, "%.2f", stats.opsPerSec / 1_000_000.0)} M ops/s)",
+                            style = MaterialTheme.typography.bodySmall.merge(TabularStyle),
+                            fontWeight = FontWeight.Medium,
+                        )
+                        val qptLine = buildList {
+                            state.cpuStressAvgPowerMw?.let { add("CPU 均功耗 ${it.roundToInt()} mW") }
+                            if ((state.cpuStressAvgCpu0Mhz ?: 0) > 0 || (state.cpuStressAvgCpu1Mhz ?: 0) > 0) {
+                                add("均频 ${state.cpuStressAvgCpu0Mhz ?: 0}/${state.cpuStressAvgCpu1Mhz ?: 0} MHz")
+                            }
+                        }.joinToString(" · ")
+                        if (qptLine.isNotEmpty()) {
+                            Text(
+                                text = qptLine,
+                                style = MaterialTheme.typography.labelSmall.merge(TabularStyle),
+                                color = semantic.goodAccent,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                    }
+                }
+            }
+
+            state.cpuStressMessage?.let { msg ->
+                Text(
+                    text = msg,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if ("不一致" in msg || "失败" in msg) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                )
             }
         }
     }

@@ -29,6 +29,9 @@ internal data class GpuEditorState(
     val stressRunning: Boolean = false,
     val stressStats: GpuStressStats? = null,
     val stressMessage: String? = null,
+    val localBaseline: GpuVoltageReference? = null,
+    val useLocalBaseline: Boolean = false,
+    val lastExportResult: GpuExportResult? = null,
 ) {
     val busy: Boolean get() = loading || operation != null
     val editable: Boolean get() = snapshot != null && !busy && loadError == null && !stressRunning
@@ -36,6 +39,7 @@ internal data class GpuEditorState(
 
 internal class GpuEditorViewModel(application: Application) : AndroidViewModel(application) {
     private val backend = GpuBackend(application.applicationContext)
+    private val baselineStore = GpuBaselineStore(application.applicationContext)
     private val stress = GpuStress(application.applicationContext)
     private val _state = MutableStateFlow(GpuEditorState())
     val state = _state.asStateFlow()
@@ -55,6 +59,7 @@ internal class GpuEditorViewModel(application: Application) : AndroidViewModel(a
         viewModelScope.launch {
             try {
                 val snapshot = backend.readCurrent()
+                val localBaseline = baselineStore.load(snapshot.source.device, snapshot.source.dtbIndex)
                 val sameSource = previous.snapshot?.sameSource(snapshot) == true
                 if (!sameSource) {
                     undo.clear()
@@ -67,6 +72,9 @@ internal class GpuEditorViewModel(application: Application) : AndroidViewModel(a
                     draft = if (sameSource) previous.draft else GpuDraft(),
                     incoming = null, loading = false, loadError = null,
                     canUndo = undo.isNotEmpty(), canRedo = redo.isNotEmpty(),
+                    localBaseline = localBaseline,
+                    useLocalBaseline = localBaseline != null &&
+                        (if (sameSource) previous.useLocalBaseline else snapshot.voltageReference == null),
                     message = if (!sameSource && !previous.draft.isEmpty) "源镜像已变化，已载入新频点表" else null,
                 )
             } catch (e: CancellationException) {
@@ -83,6 +91,35 @@ internal class GpuEditorViewModel(application: Application) : AndroidViewModel(a
                 current.copy(selectedBin = index)
             } else current
         }
+    }
+
+    fun saveLocalBaseline() {
+        val current = _state.value
+        val snapshot = current.snapshot ?: return
+        runCatching {
+            baselineStore.save(snapshot)
+        }.onSuccess { saved ->
+            _state.update {
+                it.copy(
+                    localBaseline = saved,
+                    useLocalBaseline = true,
+                    message = "已将当前镜像频压表保存为本机原厂基准",
+                )
+            }
+        }.onFailure { err ->
+            _state.update { it.copy(message = err.message ?: "保存本机原厂基准失败") }
+        }
+    }
+
+    fun setUseLocalBaseline(useLocal: Boolean) {
+        _state.update { current ->
+            if (useLocal && current.localBaseline == null) current
+            else current.copy(useLocalBaseline = useLocal)
+        }
+    }
+
+    fun shiftBinVoltage(bin: Int, stepDelta: Int, minFreqHz: Long = 0L): String? = transform { snap, draft ->
+        snap.image.shiftBinVoltage(draft, bin, stepDelta, snap.voltageCorners, minFreqHz)
     }
 
     fun editRow(bin: Int, index: Int, value: GpuLevelValue): String? = transform { snap, draft ->
@@ -162,8 +199,19 @@ internal class GpuEditorViewModel(application: Application) : AndroidViewModel(a
     }
 
     fun exportImage(uri: Uri) = operation("正在导出镜像…", abandonedDocument = uri) { snap, draft ->
-        backend.export(snap, draft, uri)
+        val result = backend.export(snap, draft, uri)
+        _state.update { it.copy(lastExportResult = result) }
         "GPU 镜像已导出"
+    }
+
+    fun exportStockBackup(uri: Uri) = operation("正在备份原厂镜像…", abandonedDocument = uri) { snap, _ ->
+        val result = backend.exportStockBackup(snap, uri)
+        _state.update { it.copy(lastExportResult = result) }
+        "原厂 GPU 镜像已备份"
+    }
+
+    fun dismissExportResult() {
+        _state.update { it.copy(lastExportResult = null) }
     }
 
     fun exportConfig(uri: Uri) = operation("正在导出配置…", abandonedDocument = uri) { snap, draft ->
@@ -243,4 +291,3 @@ internal class GpuEditorViewModel(application: Application) : AndroidViewModel(a
         }
     }
 }
-

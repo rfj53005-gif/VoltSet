@@ -712,7 +712,9 @@
         currentMv: point.voltageMv,
         baselineMv: base ? base.voltageMv : null,
         deltaMv,
-        expectedCdbCxMv: activeSet ? activeSet.predictedCxOffsetForFreq(point.domain, point.freqKhz) : null,
+        expectedCdbCxMv: activeSet
+          ? activeSet.predictedCxOffsetForBin(point.domain, point.freqKhz, point.levelIndex)
+          : null,
       };
     });
   }
@@ -830,12 +832,22 @@
   }
 
   // ---- QPT Power Monitor ----
+  function parseQptStreamFrame(line) {
+    const match = /^QPT_SAMPLE_NS=([0-9]+)\t/.exec(line);
+    if (!match) return null;
+    const timestampNs = Number(match[1]);
+    if (!Number.isFinite(timestampNs) || timestampNs <= 0) return null;
+    const sample = parseQptSample(line.slice(match[0].length).replace(/\t/g, '\n'), timestampNs);
+    return Object.keys(sample.energyUjByRail).length ? sample : null;
+  }
+
   function parseQptSample(output, timestampNs) {
     const energyUjByRail = Object.create(null);
     const powerUwByRail = Object.create(null);
     let cpu0FreqKhz = 0;
     let cpu1FreqKhz = 0;
     let gpuFreqHz = 0;
+    let cpuTempC = null;
     for (const rawLine of String(output || '').split(/\r?\n/)) {
       const line = rawLine.trim();
       if (!line) continue;
@@ -862,9 +874,12 @@
       } else if (key === 'FREQ_GPU_HZ') {
         const n = Number.parseInt(value, 10);
         if (Number.isFinite(n) && n > 0) gpuFreqHz = n;
+      } else if (key === 'TEMP_CPU_MC') {
+        const mc = Number(value);
+        if (Number.isFinite(mc) && mc >= 1000 && mc <= 130000) cpuTempC = mc / 1000.0;
       }
     }
-    return { timestampNs, energyUjByRail, powerUwByRail, cpu0FreqKhz, cpu1FreqKhz, gpuFreqHz };
+    return { timestampNs, energyUjByRail, powerUwByRail, cpu0FreqKhz, cpu1FreqKhz, gpuFreqHz, cpuTempC };
   }
 
   function computeQptDelta(prev, curr) {
@@ -898,6 +913,7 @@
       cpu0FreqKhz: curr.cpu0FreqKhz || 0,
       cpu1FreqKhz: curr.cpu1FreqKhz || 0,
       gpuFreqHz: curr.gpuFreqHz || 0,
+      cpuTempC: curr.cpuTempC !== undefined ? curr.cpuTempC : null,
     };
   }
 
@@ -916,6 +932,8 @@
       }
       return weight > 0 ? sum / weight : null;
     };
+    const avgCpu0MhzRaw = weightedMean((s) => (s.cpu0FreqKhz > 0 ? s.cpu0FreqKhz / 1000.0 : null));
+    const avgCpu1MhzRaw = weightedMean((s) => (s.cpu1FreqKhz > 0 ? s.cpu1FreqKhz / 1000.0 : null));
     return {
       sampleCount: samples.length,
       elapsedSec: totalMs / 1000.0,
@@ -924,6 +942,9 @@
       avgCpuTotalMw: weightedMean((s) => s.cpuTotalMw),
       avgGpuMw: weightedMean((s) => s.gpuMw),
       avgNspMw: weightedMean((s) => s.nspMw),
+      avgCpu0Mhz: avgCpu0MhzRaw !== null ? Math.round(avgCpu0MhzRaw) : 0,
+      avgCpu1Mhz: avgCpu1MhzRaw !== null ? Math.round(avgCpu1MhzRaw) : 0,
+      avgCpuTempC: weightedMean((s) => s.cpuTempC),
     };
   }
 
@@ -939,14 +960,18 @@
       avgGpuMw: Math.round(stats.avgGpuMw || 0),
       avgNspMw: Math.round(stats.avgNspMw || 0),
       recordedAtMs,
+      avgCpu0Mhz: stats.avgCpu0Mhz || 0,
+      avgCpu1Mhz: stats.avgCpu1Mhz || 0,
+      avgCpuTempC: stats.avgCpuTempC !== null && stats.avgCpuTempC !== undefined ? stats.avgCpuTempC : null,
     };
   }
 
   function serializePowerRecords(recordsMap) {
     return Object.values(recordsMap || {})
       .sort((a, b) => a.setId - b.setId)
-      .map((r) =>
-        [
+      .map((r) => {
+        const tempDeci = r.avgCpuTempC !== null && r.avgCpuTempC !== undefined ? Math.round(r.avgCpuTempC * 10) : -1;
+        return [
           r.setId,
           r.sampleCount,
           r.elapsedSec,
@@ -956,8 +981,11 @@
           r.avgGpuMw,
           r.avgNspMw,
           r.recordedAtMs,
-        ].join(',')
-      )
+          r.avgCpu0Mhz || 0,
+          r.avgCpu1Mhz || 0,
+          tempDeci,
+        ].join(',');
+      })
       .join('\n');
   }
 
@@ -984,6 +1012,10 @@
       ) {
         continue;
       }
+      const cpu0Mhz = cols.length >= 12 ? Math.max(0, Number.parseInt(cols[9], 10) || 0) : 0;
+      const cpu1Mhz = cols.length >= 12 ? Math.max(0, Number.parseInt(cols[10], 10) || 0) : 0;
+      const tempDeci = cols.length >= 12 ? Number.parseInt(cols[11], 10) : -1;
+      const avgCpuTempC = Number.isFinite(tempDeci) && tempDeci >= 0 ? tempDeci / 10.0 : null;
       map[setId] = {
         setId,
         sampleCount,
@@ -994,6 +1026,9 @@
         avgGpuMw: gpu,
         avgNspMw: nsp,
         recordedAtMs: Number.isFinite(ts) && ts >= 0 ? ts : 0,
+        avgCpu0Mhz: cpu0Mhz,
+        avgCpu1Mhz: cpu1Mhz,
+        avgCpuTempC,
       };
     }
     return map;
@@ -1128,7 +1163,12 @@
       qptRails: splitCsvBalanced(kv.qpt_rails),
       sdam2NvmemPath: cleanScalar(kv.sdam2_nvmem),
       sdam2Pmic: cleanScalar(kv.sdam2_pmic),
+      bootReason: cleanScalar(kv.boot_reason),
+      pstoreCrash: cleanScalar(kv.pstore_crash),
     };
+    const reasonLower = (info.bootReason || '').toLowerCase();
+    info.isAbnormalBoot = /(watchdog|wdog|wdt|panic|crash|lockup|fatal)/.test(reasonLower);
+    info.hasPstoreCrash = Boolean(info.pstoreCrash);
     info.hasAnyData = Boolean(
       info.adjDirPath ||
         info.regmapNode ||
@@ -1147,7 +1187,9 @@
         info.qfpromAging ||
         info.qptRails.length ||
         info.sdam2NvmemPath ||
-        info.sdam2Pmic
+        info.sdam2Pmic ||
+        info.bootReason ||
+        info.pstoreCrash
     );
     return info;
   }
@@ -1555,6 +1597,8 @@
         }`
       );
       lines.push(`QPT 硬件功耗轨: ${probe.qptRails.join(', ') || 'none'}`);
+      lines.push(`启动原因 (boot_reason): ${probe.bootReason || 'none'}`);
+      lines.push(`内核崩溃记录 (pstore): ${probe.pstoreCrash || 'none'}`);
     }
     const sets = snapshot.pdpCdb ? snapshot.pdpCdb.sets : [];
     if (sets.length) {
@@ -1566,6 +1610,35 @@
             `PDP0 CX ${s.clus0.minCxMv}..${s.clus0.maxCxMv} MX ${s.clus0.minMxMv}..${s.clus0.maxMxMv} | ` +
             `PDP1 CX ${s.clus1.minCxMv}..${s.clus1.maxCxMv} MX ${s.clus1.minMxMv}..${s.clus1.maxMxMv}`
         );
+      }
+    }
+    const fwLimits = snapshot.pdpHardwareLimits;
+    const setEstimates = snapshot.setEstimates || {};
+    if (fwLimits || Object.keys(setEstimates).length || snapshot.pdpFwPath) {
+      lines.push('');
+      lines.push('[pdp 硬件限位与本机预计范围]');
+      lines.push(
+        `分区: ${snapshot.pdpFwPath || 'none'} | DCVS 表: ${fwLimits ? fwLimits.totalDcvsTablesFound : 0} | ` +
+          `PDP0=${fwLimits && fwLimits.clus0 ? fwLimits.clus0.limitsByFreqKhz.size : 0} 档 ` +
+          `PDP1=${fwLimits && fwLimits.clus1 ? fwLimits.clus1.limitsByFreqKhz.size : 0} 档`
+      );
+      if (snapshot.pdpFwError) lines.push(`说明: ${snapshot.pdpFwError}`);
+      const pdp0Measured = summarizeByCluster(snapshot.voltageDiffRows || [], 0);
+      const pdp1Measured = summarizeByCluster(snapshot.voltageDiffRows || [], 1);
+      for (const s of sets) {
+        const est = setEstimates[s.setId];
+        if (!est) continue;
+        const c0Str = est.clus0
+          ? `${est.clus0.minDeltaMv}..${est.clus0.maxDeltaMv} mV (下限${est.clus0.floorClampedBins} 单调${est.clus0.monotonicityClampedBins})`
+          : '—';
+        const c1Str = est.clus1
+          ? `${est.clus1.minDeltaMv}..${est.clus1.maxDeltaMv} mV (下限${est.clus1.floorClampedBins} 单调${est.clus1.monotonicityClampedBins})`
+          : '—';
+        const measSuffix =
+          s.setId === snapshot.bootCpussIndex && (pdp0Measured.minDeltaMv !== null || pdp1Measured.minDeltaMv !== null)
+            ? ` | 实测 PDP0=${pdp0Measured.minDeltaMv}..${pdp0Measured.maxDeltaMv} PDP1=${pdp1Measured.minDeltaMv}..${pdp1Measured.maxDeltaMv}`
+            : '';
+        lines.push(`Set ${s.setId}: 本机预计 PDP0=${c0Str} | PDP1=${c1Str}${measSuffix}`);
       }
     }
     return lines.join('\n');
@@ -1604,6 +1677,7 @@
     const sdamGlobalIndex = kv.SDAM_GLOBAL_IDX !== undefined ? Number.parseInt(kv.SDAM_GLOBAL_IDX, 10) : null;
     const reg7151Hex = kv.REG_7151 && kv.REG_7151 !== 'unavailable' ? kv.REG_7151 : null;
     const pdpCdbPath = cleanScalar(kv.PDP_CDB_PATH);
+    const pdpCdbSha256 = parsePdpCdbFingerprint(kv.PDP_CDB_SHA256);
 
     let pdpCdb = null;
     let pdpCdbError = kv.PDP_CDB_ERROR || null;
@@ -1736,6 +1810,7 @@
       sdamGlobalIndex: Number.isFinite(sdamGlobalIndex) ? sdamGlobalIndex : null,
       reg7151Hex,
       pdpCdbPath,
+      pdpCdbSha256,
       pdpCdb,
       pdpCdbError,
       pdpFwPath,
@@ -1818,27 +1893,18 @@
     return tenths === 0 ? `${whole} MHz` : `${whole}.${tenths} MHz`;
   }
 
-  function parseAutoRestoreConfig(raw) {
-    const out = { enabled: false, targetSet: null };
-    if (!raw || !String(raw).trim()) return out;
-    for (const line of String(raw).split(/\r?\n/)) {
-      const eq = line.indexOf('=');
-      if (eq <= 0) continue;
-      const k = line.slice(0, eq).trim();
-      const v = line.slice(eq + 1).trim();
-      if (k === 'enabled') out.enabled = v === '1';
-      else if (k === 'target_set') {
-        const n = Number.parseInt(v, 10);
-        if (Number.isFinite(n) && n >= 2 && n <= 7) out.targetSet = n;
-      }
-    }
-    return out;
+  function parsePdpCdbFingerprint(raw) {
+    return typeof raw === 'string' && /^[0-9a-f]{64}$/.test(raw) ? raw : null;
   }
 
-  function serializeAutoRestoreConfig(cfg) {
-    const enabled = cfg && cfg.enabled && cfg.targetSet >= 2 && cfg.targetSet <= 7 ? 1 : 0;
-    const target = cfg && cfg.targetSet >= 2 && cfg.targetSet <= 7 ? cfg.targetSet : '';
-    return `enabled=${enabled}\ntarget_set=${target}\n`;
+  function parseAutoRestoreConfig(raw) {
+    const { values } = parseBackendOutput(raw);
+    const targetSet = /^[2-7]$/.test(values.target_set || '') ? Number(values.target_set) : null;
+    return {
+      enabled: values.enabled === '1' && targetSet !== null,
+      targetSet,
+      pdpCdbSha256: parsePdpCdbFingerprint(values.pdp_cdb_sha256),
+    };
   }
 
   function parseAutoRestoreStatus(raw) {
@@ -1875,6 +1941,7 @@
     estimateAllSets,
     computeBootSetStatus,
     parseQptSample,
+    parseQptStreamFrame,
     computeQptDelta,
     summarizeQptSession,
     buildSavedPowerRecord,
@@ -1889,7 +1956,6 @@
     buildDeviceSnapshot,
     enrichSnapshotHelpers,
     parseAutoRestoreConfig,
-    serializeAutoRestoreConfig,
     parseAutoRestoreStatus,
     formatSignedMv,
     formatRange,

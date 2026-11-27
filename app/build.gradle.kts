@@ -1,6 +1,15 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+val versionProps = Properties().apply {
+    val file = rootProject.file("version.properties")
+    if (file.isFile) {
+        file.inputStream().use { load(it) }
+    }
 }
 
 android {
@@ -11,8 +20,13 @@ android {
         applicationId = "io.voltset.sm8850"
         minSdk = 30
         targetSdk = 36
-        versionCode = providers.gradleProperty("releaseVersionCode").orElse("15").get().toInt()
-        versionName = providers.gradleProperty("releaseVersionName").orElse("0.5.3").get()
+        versionCode = providers.gradleProperty("releaseVersionCode")
+            .orElse(versionProps.getProperty("versionCode", "20"))
+            .get()
+            .toInt()
+        versionName = providers.gradleProperty("releaseVersionName")
+            .orElse(versionProps.getProperty("versionName", "0.6.0"))
+            .get()
     }
 
     buildTypes {
@@ -56,14 +70,16 @@ val syncKernelModules by tasks.registering(Sync::class) {
     }
 }
 
-val nativeHelpersDir = rootProject.file("native/vsetns/prebuilt")
-val nativeHelperFile = nativeHelpersDir.resolve("arm64-v8a/vsetns")
+val nativeHelperFiles = listOf(
+    rootProject.file("native/vsetns/prebuilt/arm64-v8a/vsetns"),
+    rootProject.file("native/qpt/prebuilt/arm64-v8a/vsetqpt"),
+)
 
 val syncNativeHelpers by tasks.registering(Sync::class) {
-    from(nativeHelperFile)
+    from(nativeHelperFiles)
     into(generatedAssets.map { it.dir("backend/bin") })
     doFirst {
-        check(nativeHelperFile.isFile) { "Missing native helper: $nativeHelperFile" }
+        nativeHelperFiles.forEach { file -> check(file.isFile) { "Missing native helper: $file" } }
     }
 }
 

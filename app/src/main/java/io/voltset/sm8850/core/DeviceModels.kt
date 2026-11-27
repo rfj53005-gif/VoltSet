@@ -49,6 +49,7 @@ data class DeviceSnapshot(
     val sdamGlobalIndex: Int?,
     val reg7151Hex: String?,
     val pdpCdbPath: String?,
+    val pdpCdbSha256: String? = null,
     val pdpCdb: PdpCdbData?,
     val pdpCdbError: String?,
     val pdpFwPath: String?,

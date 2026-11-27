@@ -1,0 +1,90 @@
+{
+  "pdpCdbSha256": "a9702e7aefe0e76bda7b4a0144dcec913a736d9a774104fcff831be91d8e05af",
+  "bootId": "golden-boot-id-0001",
+  "socModel": "SM8850",
+  "deviceModel": "PLR110",
+  "overrideSetId": null,
+  "activeSetId": 3,
+  "cdtState": "STOCK",
+  "cdtVersion": 6,
+  "cdtKey7Enabled": false,
+  "compatibilityLevel": "PARTIAL",
+  "passedCount": 7,
+  "totalCount": 8,
+  "totalDcvsTablesFound": 2,
+  "clus0FreqCount": 4,
+  "clus1FreqCount": 4,
+  "scmiPointsCount": 8,
+  "baselinePointsCount": 8,
+  "qualityScore": 2610,
+  "bootReason": "reboot,userrequested",
+  "pstoreCrash": null,
+  "isAbnormalBoot": false,
+  "hasPstoreCrash": false,
+  "qptRailsCount": 4,
+  "sets": [
+    {
+      "setId": 1,
+      "tag": "DEFAULT",
+      "isActive": false,
+      "clus0MinDeltaMv": 0,
+      "clus0MaxDeltaMv": 0,
+      "clus1MinDeltaMv": 0,
+      "clus1MaxDeltaMv": 0
+    },
+    {
+      "setId": 2,
+      "tag": "UNIFORM",
+      "isActive": false,
+      "clus0MinDeltaMv": -12,
+      "clus0MaxDeltaMv": -12,
+      "clus1MinDeltaMv": -12,
+      "clus1MaxDeltaMv": -12
+    },
+    {
+      "setId": 3,
+      "tag": "UNIFORM",
+      "isActive": true,
+      "clus0MinDeltaMv": -24,
+      "clus0MaxDeltaMv": -24,
+      "clus1MinDeltaMv": -24,
+      "clus1MaxDeltaMv": -24
+    },
+    {
+      "setId": 4,
+      "tag": "UNIFORM",
+      "isActive": false,
+      "clus0MinDeltaMv": -36,
+      "clus0MaxDeltaMv": -36,
+      "clus1MinDeltaMv": -36,
+      "clus1MaxDeltaMv": -36
+    },
+    {
+      "setId": 5,
+      "tag": "UNIFORM",
+      "isActive": false,
+      "clus0MinDeltaMv": -48,
+      "clus0MaxDeltaMv": -48,
+      "clus1MinDeltaMv": -44,
+      "clus1MaxDeltaMv": -44
+    },
+    {
+      "setId": 6,
+      "tag": "CURVE",
+      "isActive": false,
+      "clus0MinDeltaMv": -56,
+      "clus0MaxDeltaMv": 0,
+      "clus1MinDeltaMv": -52,
+      "clus1MaxDeltaMv": 0
+    },
+    {
+      "setId": 7,
+      "tag": "CURVE",
+      "isActive": false,
+      "clus0MinDeltaMv": -64,
+      "clus0MaxDeltaMv": 0,
+      "clus1MinDeltaMv": -60,
+      "clus1MaxDeltaMv": 0
+    }
+  ]
+}
